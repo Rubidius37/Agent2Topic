@@ -1,0 +1,57 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Workspace Viewer</title>
+  <link rel="stylesheet" href="/viewer.css">
+</head>
+<body>
+  <div class="app-shell">
+    <aside class="sidebar">
+      <div class="sidebar-header">
+        <div class="brand-row">
+          <div class="brand-title">
+            <span class="brand-badge">RO</span>
+            <span id="app-title">Workspace Viewer</span>
+          </div>
+          <div class="header-actions">
+            <button id="lang-toggle" class="icon-btn" type="button" title="Switch language">EN</button>
+            <button id="refresh-tree" class="icon-btn" type="button" title="Refresh folder tree">↻</button>
+          </div>
+        </div>
+        <div id="stats-bar" class="stats-bar"></div>
+        <div class="search-row">
+          <input id="tree-search" type="search" placeholder="파일 또는 주제 경로 검색..." autocomplete="off">
+        </div>
+        <div class="tree-controls">
+          <button id="expand-all" class="link-btn" type="button">모두 펼치기</button>
+          <span>·</span>
+          <button id="collapse-all" class="link-btn" type="button">모두 접기</button>
+        </div>
+      </div>
+      <nav id="folder-tree" class="folder-tree" aria-label="Workspace files"></nav>
+    </aside>
+
+    <main class="reader-pane">
+      <header class="reader-toolbar">
+        <div class="nav-buttons">
+          <button id="history-back" class="toolbar-btn" type="button" disabled title="뒤로">←</button>
+          <button id="history-forward" class="toolbar-btn" type="button" disabled title="앞으로">→</button>
+        </div>
+        <div id="breadcrumb" class="breadcrumb">문서를 선택하세요</div>
+        <div class="view-mode-switch">
+          <button id="mode-rendered" class="mode-btn active" type="button">Rendered</button>
+          <button id="mode-raw" class="mode-btn" type="button">Markdown</button>
+        </div>
+      </header>
+
+      <div id="reader-scroll" class="reader-scroll">
+        <article id="markdown-view" class="markdown-body"></article>
+        <pre id="raw-view" class="raw-body" hidden></pre>
+      </div>
+    </main>
+  </div>
+  <script src="/viewer.js"></script>
+</body>
+</html>

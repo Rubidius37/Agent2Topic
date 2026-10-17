@@ -1,0 +1,38 @@
+# Local workspace content
+/Workspace/Daily_Logs/*
+!/Workspace/Daily_Logs/.gitkeep
+/Workspace/Subject/
+/Workspace/Subject_Hierarchical/
+/Workspace/_Generated/
+/Workspace/Topic_Reviews/
+/Workspace/Topic_Reviews_Hierarchical/
+/Workspace/_Legacy_Backup/
+/Workspace/attachments/*
+!/Workspace/attachments/.gitkeep
+/Workspace/scripts/
+.obsidian/
+
+# Secrets and local environment
+scripts/.env
+.env
+
+# Generated runtime data
+scripts/organizer_metadata.json
+scripts/organizer_metadata_hierarchical.json
+scripts/source_id_backups/
+scripts/.runtime/
+scripts/__pycache__/
+__pycache__/
+*.pyc
+scripts/reports/
+
+# Local agent/tooling state
+.agents/
+.codex/
+.gemini/
+
+# OS/editor noise
+Thumbs.db
+Desktop.ini
+.DS_Store
+*.zip
