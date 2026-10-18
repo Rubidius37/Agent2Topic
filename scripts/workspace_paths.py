@@ -5,7 +5,8 @@ import os
 
 WORKSPACE_DIRECTORY_NAME = "Workspace"
 RULES_FILENAME = "Classification_Rules.md"
-VAULT_ENV_VAR = "PAGENT_VAULT_DIR"
+VAULT_ENV_VAR = "AGENT2TOPIC_VAULT_DIR"
+LEGACY_VAULT_ENV_VAR = "PAGENT_VAULT_DIR"
 
 
 def get_application_root(script_dir):
@@ -43,7 +44,10 @@ def resolve_active_workspace_dir(script_dir, cwd=None, explicit_vault_dir=None, 
     """Resolve the active workspace from explicit arg, env var, CWD ancestry, or bundled default."""
     if explicit_vault_dir:
         return os.path.abspath(explicit_vault_dir)
-    env_vault = os.environ.get(VAULT_ENV_VAR, "").strip()
+    env_vault = (
+        os.environ.get(VAULT_ENV_VAR, "").strip()
+        or os.environ.get(LEGACY_VAULT_ENV_VAR, "").strip()
+    )
     if env_vault:
         return os.path.abspath(env_vault)
 

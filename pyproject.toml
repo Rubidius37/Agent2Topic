@@ -3,16 +3,17 @@ requires = ["setuptools>=61.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "pagent"
+name = "agent2topic"
 dynamic = ["version"]
-description = "Deterministic Markdown work-history and topic context compiler for AI agents and humans"
+description = "Agents work by time, reason by topic — Deterministic Markdown work-history compiler for AI agents and humans"
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "GPL-3.0-only" }
 dependencies = []
 
 [project.scripts]
-pagent = "agent_cli:main"
+agent2topic = "agent_cli:main"
+a2t = "agent_cli:main"
 
 [tool.setuptools]
 include-package-data = true

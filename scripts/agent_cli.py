@@ -53,8 +53,8 @@ from workspace_paths import (
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_VAULT_DIR = resolve_workspace_dir(SCRIPT_DIR)
-PAGENT_VERSION = "0.3.1"
-DEFAULT_GITHUB_REPO = "Rubidius37/Project_Agent"
+PAGENT_VERSION = "1.0.0"
+DEFAULT_GITHUB_REPO = "Rubidius37/Agent2Topic"
 
 DEFAULT_CONTEXT_MAX_CHARS = 12000
 DEFAULT_REVIEW_ENTRY_CHARS = 1200
@@ -159,7 +159,7 @@ def _truncate_text(text, limit, source_id=None):
     if limit == 0:
         return "", bool(raw)
     suffix = (
-        f"\n...(truncated; run 'pagent source --id {source_id}' for full text)"
+        f"\n...(truncated; run 'a2t source --id {source_id}' for full text)"
         if source_id and limit >= 80
         else "…"
     )
@@ -985,6 +985,7 @@ def _parse_semver_tuple(raw_version):
 def check_remote_version(repo=None, timeout=5):
     target_repo = (
         str(repo or "").strip()
+        or os.environ.get("AGENT2TOPIC_GITHUB_REPO", "").strip()
         or os.environ.get("PAGENT_GITHUB_REPO", "").strip()
         or DEFAULT_GITHUB_REPO
     )
@@ -995,13 +996,13 @@ def check_remote_version(repo=None, timeout=5):
         url,
         headers={
             "Accept": "application/vnd.github+json",
-            "User-Agent": f"pagent/{PAGENT_VERSION}",
+            "User-Agent": f"agent2topic/{PAGENT_VERSION}",
         },
         method="GET",
     )
     upgrade_cmds = [
-        "uv tool upgrade pagent",
-        "pipx upgrade pagent",
+        "uv tool upgrade agent2topic",
+        "pipx upgrade agent2topic",
         "git pull --ff-only",
     ]
     try:
@@ -1034,14 +1035,14 @@ def check_remote_version(repo=None, timeout=5):
 
 def build_parser():
     parser = argparse.ArgumentParser(
-        prog="pagent",
-        description="Deterministic Markdown work-history compiler & viewer for AI agents and humans.",
+        prog="agent2topic",
+        description="Agent2Topic (a2t) — Deterministic Markdown work-history compiler & viewer for AI agents and humans.",
     )
     parser.add_argument(
         "--version",
         "-V",
         action="version",
-        version=f"pagent {PAGENT_VERSION}",
+        version=f"agent2topic {PAGENT_VERSION}",
     )
     parser.add_argument("--vault-dir", default=None, help="Override Workspace directory path.")
     sub = parser.add_subparsers(dest="subcommand", required=True)
@@ -1183,13 +1184,13 @@ def main(argv=None):
                     "version": PAGENT_VERSION,
                     "checked_remote": False,
                     "upgrade_commands": [
-                        "uv tool upgrade pagent",
-                        "pipx upgrade pagent",
+                        "uv tool upgrade agent2topic",
+                        "pipx upgrade agent2topic",
                         "git pull --ff-only",
                     ],
                 }
             payload = {"status": "ok", **info}
-            lines = [f"pagent {PAGENT_VERSION}"]
+            lines = [f"agent2topic {PAGENT_VERSION}"]
             if args.check:
                 if info.get("checked_remote"):
                     if info.get("update_available"):
@@ -1286,8 +1287,18 @@ def main(argv=None):
             ensure_workspace_initialized(vault_dir)
             body = sys.stdin.read() if args.stdin else args.content
             effective_commit = args.commit or (detect_git_head_commit() if args.git else None)
-            effective_agent = args.agent or os.environ.get("PAGENT_AGENT_ID", "").strip() or None
-            effective_session = args.session or os.environ.get("PAGENT_SESSION_ID", "").strip() or None
+            effective_agent = (
+                args.agent
+                or os.environ.get("AGENT2TOPIC_AGENT_ID", "").strip()
+                or os.environ.get("PAGENT_AGENT_ID", "").strip()
+                or None
+            )
+            effective_session = (
+                args.session
+                or os.environ.get("AGENT2TOPIC_SESSION_ID", "").strip()
+                or os.environ.get("PAGENT_SESSION_ID", "").strip()
+                or None
+            )
             with VaultProcessLock(vault_dir, "agent-append", command=command_text(__file__, argv)):
                 res = append_log_entry(
                     vault_dir,

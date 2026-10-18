@@ -1,30 +1,47 @@
-# Project_Agent
+# Agent2Topic
 
 **English** · [한국어](README.ko.md)
 
+[![CI](https://github.com/Rubidius37/Agent2Topic/actions/workflows/ci.yml/badge.svg)](https://github.com/Rubidius37/Agent2Topic/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/Rubidius37/Agent2Topic?color=2563eb&label=Release)](https://github.com/Rubidius37/Agent2Topic/releases)
+[![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B%20(Zero%20Deps)-0f766e)](pyproject.toml)
+[![License: GPL-3.0](https://img.shields.io/badge/License-GPL--3.0-blue.svg)](LICENSE)
+
 **Agents Work by Time, Reason by Topic — A Deterministic Markdown Work-History Compiler for AI Agents & Humans**
 
-When AI coding or research agents (Codex, Claude Code, OpenCode) work across multiple sessions, appending everything to a single memory file quickly blows up the context window, while vector databases lose chronological causality (*"Why did we switch from approach A to B last week?"*).
+When AI coding or research agents (Codex, Claude Code, OpenCode) work across multiple sessions, appending everything to a single `MEMORY.md` quickly blows up the context window, while vector databases lose chronological causality (*"Why did we switch from approach A to B last week?"*).
 
-**Project_Agent** solves this with **zero LLM token overhead**:
-1. **Agents (or humans) append discrete work events (`Entries`)** to `Workspace/Daily_Logs/` with `--files`, `--kind`, and `--git` / `--commit` tags.
-2. **A deterministic Python rule engine** tracks each individual entry (`###### <Title>`) with its own permanent `Source ID`, pre-indexes metadata (`kind`, `files`, `commit`, `summary`) into `organizer_metadata.json`, and compiles topic documents (`Workspace/Subject/`) and bounded chronological reviews (`Workspace/Topic_Reviews/`).
-3. **Agents recall bounded context** by topic (`pagent context --mode index|review|entries --max-chars 12000`) or search the pre-built index by modified file path, kind, commit, or keyword (`pagent search`).
-4. **Humans inspect the workspace** anytime via Obsidian, VS Code, or the strictly read-only **Local Web Viewer (`pagent view`)**.
+**Agent2Topic (`a2t`)** compiles chronological agent work logs (`Daily_Logs/`) into structured topic documents (`Subject/`), bounded chronological reviews (`Topic_Reviews/`), and a pre-indexed metadata table—with **zero LLM token overhead** and **zero external dependencies**.
+
+[Why Agent2Topic?](#why-agent2topic) · [How It Works](#how-it-works) · [Comparison](#how-does-it-compare) · [Quick Start](#quick-start) · [CLI Reference](#cli-reference) · [Agent Protocol (`AGENTS.md`)](AGENTS.md)
 
 ---
 
-## Core Architecture
+## Why Agent2Topic?
+
+While building and using [Log2Topic](https://github.com/Rubidius37/Log2Topic) to organize daily research and engineering logs by topic, one of its biggest strengths was **not being locked into any specific Markdown editor or plugin ecosystem**. Because everything lived in standard Markdown files on disk, any tool could read and write them.
+
+As AI agents (Codex, Claude Code, OpenCode) became a daily part of software engineering and research, the exact same problem surfaced: agents produce diverse records—architectural decisions, root-cause bug analyses, experiments, and refactors—that scatter across chronological sessions. **Just like human research notes, I wanted to gather the diverse records left by AI agents by topic (`Topic`), so both future agent sessions and humans can trace the complete history of any subject at a glance.**
+
+**Agent2Topic** adapts `Log2Topic`'s deterministic 5-level rule engine into an agent-native CLI (`agent2topic` / `a2t`) with discrete H6 work-event (`Entry`) tracking, instant file/commit/kind search, strictly bounded context budgets (`--max-chars`), and a built-in read-only web viewer (`a2t view`).
+
+---
+
+## How It Works
+
+<p align="center">
+  <img src="assets/agent2topic-demo.gif" alt="Agent2Topic 3-step workflow demo" width="100%">
+</p>
 
 ```mermaid
 flowchart TD
-    A["AI Agent / Developer<br/>pagent append --path ... --files ... --kind ... --git"]
+    A["AI Agent / Developer<br/>a2t append --path ... --files ... --kind ... --git"]
     B["Single Source of Truth<br/>Workspace/Daily_Logs/*.md<br/>Workspace/Classification_Rules.md"]
     C["Deterministic Python Compiler<br/>hierarchical_classifier.py (0 LLM Tokens)"]
-    D["Subject Documents & Metadata Index<br/>Workspace/Subject/ + organizer_metadata.json"]
+    D["Subject Documents & Pre-Built Index<br/>Workspace/Subject/ + organizer_metadata.json"]
     E["Bounded Topic Reviews<br/>Workspace/Topic_Reviews/"]
-    F["Bounded Context & Instant Search<br/>pagent context --mode review / pagent search --file ..."]
-    G["Human Read-Only Web Viewer<br/>pagent view (127.0.0.1:8000)"]
+    F["Bounded Context & Instant Search<br/>a2t context --mode review / a2t search --file ..."]
+    G["Human Read-Only Web Viewer<br/>a2t view (127.0.0.1:8000)"]
 
     A --> B
     B --> C
@@ -36,12 +53,25 @@ flowchart TD
     E --> G
 ```
 
-### Key Capabilities
-- **Topic Hierarchy + Independent Entry Identity**: In daily logs, `#`–`#####` define the 1–5 level Topic path (reused without repetition across same-day entries), while `###### <Title>` defines each discrete Work Event (`Entry`) with its own permanent `Source ID`, `Kind`, `Files`, and `Commit`.
-- **Strictly Bounded Context (`pagent context`)**: Supports `--mode index` (lightweight metadata list), `--mode review` (compiled topic review + entry summaries), and `--mode entries` (bounded excerpts), all strictly capped by `--max-chars` (default `12000`). Full raw text is fetched on demand via `pagent source --id <ID>`.
-- **Pre-Indexed File, Kind & Commit Search (`pagent search`)**: Queries `organizer_metadata.json` directly without re-parsing source Markdown files on disk.
-- **Windows `.venv` & Multi-Agent Lock Safety**: `VaultProcessLock` walks the ancestor process tree (`CreateToolhelp32Snapshot` on Windows) so lock delegation works reliably across `.venv` launcher stubs.
-- **Strictly Read-Only Web Viewer (`pagent view`)**: Does not modify source files on launch unless `--refresh` is explicitly passed.
+1. **Topic Hierarchy (`#`–`#####`) + Discrete Work Event Identity (`######`)**:
+   - In `Daily_Logs/YYYY-MM-DD.md`, `#` through `#####` represent the 1–5 level **Topic** path (shared without repetition across same-day entries), while each `a2t append` writes a `###### <Title>` **Entry** with its own permanent `Source ID`, `Kind`, `Files`, `Commit`, `Agent`, and `Session` metadata.
+2. **Pre-Indexed File, Kind & Commit Search (`a2t search`)**:
+   - Coding agents often know the file they are editing (`src/login.py`), not the topic name. `a2t search --file "src/login.py"` queries the pre-built index in milliseconds (with automatic full-text fallback for entries > 4,000 chars) and returns matching entries plus their related `Topic_Reviews` paths.
+3. **Strictly Bounded Context (`a2t context`)**:
+   - Enforces a hard ceiling on the serialized JSON output (`--max-chars`, default `12000`) with built-in pagination (`--offset`, `returned_entries`, `has_more`, `next_offset`) across three modes: `index`, `review`, and `entries`.
+4. **Human Audit via Obsidian, VS Code, or Read-Only Web Viewer (`a2t view`)**:
+   - Humans can open `Workspace/` in any Markdown editor or run `a2t view` to browse the folder tree, on-page TOC, and rendered Markdown in a local browser.
+
+---
+
+## How Does It Compare?
+
+| Approach | Context Cost | Chronological Causality | Provenance (`Source ID` + Git SHA) | Editor / Cloud Lock-in |
+| :--- | :--- | :--- | :--- | :--- |
+| **Single `MEMORY.md` / `CLAUDE.md`** | Grows unbounded; overflows context | Mixed topics in one flat file | None | None |
+| **Vector DB / Embedding Memory** | Requires embedding API / DB | Lost (similarity $\neq$ timeline) | Opaque chunks | Requires vector store |
+| **Obsidian Plugins (Dataview / Mover)** | Manual UI only | Plugin-dependent queries | Breaks on heading rename | Locked to Obsidian GUI |
+| **Agent2Topic (`a2t`)** | **Strictly bounded (`--max-chars`) & 0 LLM tokens to compile** | **Preserved per Topic (`Topic_Reviews/`)** | **Permanent `Source ID` + `Files` + `Commit` + `Agent`** | **100% Plain Markdown + Python stdlib** |
 
 ---
 
@@ -49,77 +79,98 @@ flowchart TD
 
 **Requirements**: Python 3.10+ (100% Python standard library; zero external dependencies).
 
+### 1. Install
 ```bash
+# Option A: Install globally via uv or pipx (Recommended)
+uv tool install git+https://github.com/Rubidius37/Agent2Topic.git
+# (or: pipx install git+https://github.com/Rubidius37/Agent2Topic.git)
+
+# Option B: Clone and editable install
+git clone https://github.com/Rubidius37/Agent2Topic.git
+cd Agent2Topic
 pip install -e .
 ```
+Both `agent2topic` and the short alias `a2t` (as well as `./a2t.bat` and `./a2t.sh`) are available.
 
-### 1. Initialize Workspace
+### 2. Initialize a Workspace
 ```bash
-.\pagent.bat init
+# Initialize bundled Workspace (or pass --here inside any external project repository)
+a2t init
 ```
 
-### 2. Append Work Entries
+### 3. Append Work Events (`a2t append`)
 ```bash
-.\pagent.bat append ^
-  --path "Projects/CoreEngine/Parser" ^
-  --title "Fix fenced code block boundary detection" ^
-  --kind "bugfix" ^
-  --files "scripts/hierarchical_classifier.py" ^
-  --git ^
-  --content "Updated source_lines_with_code_context to handle tilde fences." ^
+a2t append \
+  --path "Projects/Alpha/Auth" \
+  --title "Session cookie architecture" \
+  --kind "decision" \
+  --files "src/auth.py" \
+  --git \
+  --content "Adopted HttpOnly session cookies instead of stateless JWT." \
   --create-rule
+
+a2t append \
+  --path "Projects/Alpha/Auth" \
+  --title "Fix expired login crash" \
+  --kind "bugfix" \
+  --files "src/login.py" \
+  --git \
+  --content "Handled null session state before token refresh."
 ```
 
-### 3. Search & Retrieve Bounded Context
+### 4. Search & Recall Bounded Context (`a2t search` / `a2t context`)
 ```bash
-# Search pre-indexed entries by file, kind, or commit
-.\pagent.bat search --file "hierarchical_classifier.py" --kind "bugfix" --json
+# Find past bugfixes or decisions touching a specific file
+a2t search --file "src/login.py" --kind "bugfix" --json
 
-# Retrieve bounded topic review (strictly capped at 12,000 chars)
-.\pagent.bat context --topic "Projects/CoreEngine" --mode review --max-chars 12000 --json
+# Retrieve bounded topic review (strictly capped at --max-chars)
+a2t context --topic "Projects/Alpha/Auth" --mode review --max-chars 12000 --json
+
+# Fetch full untruncated text of a specific Source ID when needed
+a2t source --id <SOURCE_ID> --json
 ```
 
-### 4. Browse in the Read-Only Web Viewer
+### 5. Browse in the Read-Only Web Viewer (`a2t view`)
 ```bash
-.\pagent.bat view
+a2t view
 ```
+Opens `http://127.0.0.1:8000` with folder tree navigation, real-time filtering, on-page TOC, and Markdown HTML rendering. Closing all browser tabs automatically stops the server after 3 seconds.
 
 ---
 
-## Installation & Updating
+## CLI Reference (`a2t` / `agent2topic`)
 
-Because user data lives in `Workspace/` (ignored by Git and separate from the CLI package), updating the tool never touches your notes.
+| Subcommand | Example | Description |
+| :--- | :--- | :--- |
+| `init` | `a2t init [--here] [--json]` | Initialize `Workspace/Daily_Logs/`, `attachments/`, and `Classification_Rules.md`. |
+| `rules` | `a2t rules [--json]` | List all configured 1–5 level category paths and supplemental keywords. |
+| `rule-add` | `a2t rule-add --path "Projects/Alpha/API" --keywords "rest, endpoint" [--json]` | Add a new topic path or keywords to the inherited table in `Classification_Rules.md`. |
+| `append` | `a2t append --path "Projects/Alpha/API" --title "Auth fix" --kind bugfix --files "src/auth.py" --git --create-rule [--json]` | Append an independent `######` Entry to `Daily_Logs/YYYY-MM-DD.md` and run the Python classifier. |
+| `search` | `a2t search [--query "..."] [--file "..."] [--kind "..."] [--commit "..."] [--agent "..."] [--session "..."] [--deep] [--max-chars 12000] [--json]` | Search pre-indexed entries (with automatic full-text fallback for >4,000 char entries). |
+| `context` | `a2t context --topic "Projects/Alpha" [--mode review\|index\|entries] [--max-chars 12000] [--limit 5] [--offset 0] [--json]` | Return strictly bounded topic context with pagination (`returned_entries`, `has_more`, `next_offset`). |
+| `update` | `a2t update [--dry-run] [--rebuild-ids] [--json]` | Run the deterministic Python classifier (`Daily_Logs/` → `Subject/` + `Topic_Reviews/`). |
+| `status` | `a2t status [--json]` | Check classification statistics and any `needs_review` entries. |
+| `classify` | `a2t classify --source-id <ID> --path "Projects/Alpha/API" [--json]` | Assign or clear a manual `Category:` override for a specific `Source ID`. |
+| `source` | `a2t source --id <ID> [--max-chars N] [--json]` | Inspect the original log file, line number, metadata, and full content of a `Source ID`. |
+| `view` | `a2t view [--port 8000] [--refresh]` | Launch the strictly read-only local web viewer (`http://127.0.0.1:8000`). |
+| `version` | `a2t version [--check] [--json]` | Show installed version and manually check GitHub Releases for updates. |
 
-### Option A: `uv` or `pipx` (Recommended)
+---
+
+## Updating
+
+Because user data lives in `Workspace/` (ignored by Git and separate from the CLI package), updating the tool never modifies your logs or rules:
 ```bash
-# Install
-uv tool install git+https://github.com/Rubidius37/Project_Agent.git
-# (or: pipx install git+https://github.com/Rubidius37/Project_Agent.git)
+# If installed via uv / pipx
+uv tool upgrade agent2topic
+pipx upgrade agent2topic
 
-# Upgrade to latest version
-uv tool upgrade pagent
-```
-
-### Option B: `git clone` + Editable Install
-```bash
-git clone https://github.com/Rubidius37/Project_Agent.git
-cd Project_Agent
-pip install -e .
-
-# Upgrade to latest version
+# If installed via git clone
 git pull --ff-only
-```
 
-### Check for Updates (Read-Only)
-`pagent` never performs background network calls or unprompted self-updates. You can manually check if a newer release tag exists on GitHub:
-```bash
-pagent version --check
+# Manually check if a newer release exists on GitHub
+a2t version --check
 ```
-
-### Publishing Releases & PyPI (Maintainer Guide)
-`.github/workflows/release.yml` is pre-configured:
-1. Pushing a version tag (`git tag v0.3.0 && git push origin v0.3.0`) runs the test suite, builds the Python wheel/sdist, verifies bundled `viewer_ui` assets, and publishes a **GitHub Release** with `SHA256SUMS.txt`.
-2. To enable automatic **PyPI** publishing later: register this repository as a [PyPI Trusted Publisher](https://docs.pypi.org/trusted-publishers/) (environment name: `pypi`) and set the GitHub repository variable `PYPI_ENABLED=true`.
 
 ---
 

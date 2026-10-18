@@ -4,7 +4,7 @@
   const SESSION_ID = "viewer_" + Math.random().toString(36).slice(2) + "_" + Date.now();
   const I18N = {
     ko: {
-      title: "Workspace 뷰어",
+      title: "Agent2Topic 뷰어",
       searchPlaceholder: "파일 또는 주제 경로 검색...",
       expandAll: "모두 펼치기",
       collapseAll: "모두 접기",
@@ -19,7 +19,7 @@
       loadError: "문서를 불러오지 못했습니다: ",
     },
     en: {
-      title: "Workspace Viewer",
+      title: "Agent2Topic Viewer",
       searchPlaceholder: "Filter files or topic paths...",
       expandAll: "Expand all",
       collapseAll: "Collapse all",

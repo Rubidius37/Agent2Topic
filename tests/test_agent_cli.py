@@ -499,7 +499,7 @@ class AgentCliTests(unittest.TestCase):
             self.assertTrue(checked["checked_remote"])
             self.assertTrue(checked["update_available"])
             self.assertEqual(checked["latest_version"], "9.9.0")
-            self.assertIn("uv tool upgrade pagent", checked["upgrade_commands"])
+            self.assertIn("uv tool upgrade agent2topic", checked["upgrade_commands"])
 
 
 if __name__ == "__main__":

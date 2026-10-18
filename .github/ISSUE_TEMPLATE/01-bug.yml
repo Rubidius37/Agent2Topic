@@ -1,0 +1,30 @@
+name: Bug Report
+description: Report a bug or unexpected behavior in Agent2Topic
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thank you for reporting an issue! **Do not attach private research notes or credentials.** Use a minimal, reproducible fictional example instead.
+  - type: input
+    id: version
+    attributes:
+      label: Version & OS
+      description: Output of `a2t --version`, OS, and Python version
+      placeholder: "agent2topic 1.0.0, Windows 11 / Ubuntu 24.04, Python 3.12"
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to Reproduce
+      description: Commands and minimal sample Markdown input to reproduce the issue
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected vs Actual Behavior
+    validations:
+      required: true

@@ -1,0 +1,18 @@
+name: Feature Request
+description: Suggest an improvement or workflow enhancement for Agent2Topic
+title: "[Feature]: "
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem or Agent Workflow Use Case
+      description: Which AI agent (Codex, Claude Code, OpenCode, etc.) or human workflow would this improve?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed CLI / Viewer Behavior
+    validations:
+      required: true
