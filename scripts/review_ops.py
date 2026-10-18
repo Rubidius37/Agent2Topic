@@ -27,7 +27,7 @@ from hierarchical_classifier import (
     source_unit_fingerprint,
 )
 from process_lock import delegated_lock_environment
-from workspace_paths import resolve_workspace_dir
+from workspace_paths import resolve_workspace_dir, resolve_workspace_state_dir
 
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -386,8 +386,14 @@ def apply_manual_categories(
     vault_dir=VAULT_DIR,
     metadata_path=METADATA_PATH,
     rules_path=RULES_PATH,
-    backup_dir=BACKUP_DIR,
+    backup_dir=None,
 ):
+    if backup_dir is None:
+        backup_dir = os.path.join(
+            resolve_workspace_state_dir(SCRIPT_DIR, vault_dir),
+            "source_id_backups",
+            "classification_review",
+        )
     if not isinstance(source_id, str) or not SOURCE_ID_VALUE_RE.fullmatch(source_id):
         raise ReviewError("Source ID 형식이 올바르지 않습니다.")
     if not isinstance(expected_fingerprint, str) or not expected_fingerprint:
@@ -469,8 +475,14 @@ def remove_manual_categories(
     vault_dir=VAULT_DIR,
     metadata_path=METADATA_PATH,
     rules_path=RULES_PATH,
-    backup_dir=BACKUP_DIR,
+    backup_dir=None,
 ):
+    if backup_dir is None:
+        backup_dir = os.path.join(
+            resolve_workspace_state_dir(SCRIPT_DIR, vault_dir),
+            "source_id_backups",
+            "classification_review",
+        )
     if not isinstance(source_id, str) or not SOURCE_ID_VALUE_RE.fullmatch(source_id):
         raise ReviewError("Source ID 형식이 올바르지 않습니다.")
     if not isinstance(expected_fingerprint, str) or not expected_fingerprint:
@@ -524,6 +536,8 @@ def run_production_classifier(vault_dir=VAULT_DIR, lock_held_by_parent=False, ex
     command = [
         sys.executable,
         os.path.join(SCRIPT_DIR, "hierarchical_classifier.py"),
+        "--vault-dir",
+        os.path.abspath(vault_dir),
         "--production",
         "--output-dir",
         "Subject",

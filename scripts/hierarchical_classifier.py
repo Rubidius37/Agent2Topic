@@ -27,7 +27,7 @@ from document_utils import (
     make_markdown_link, normalize_rel_path, parse_stem_date,
     sanitize_filename, source_date_key, strip_markdown_target_title,
 )
-from workspace_paths import resolve_workspace_dir
+from workspace_paths import resolve_workspace_dir, resolve_workspace_state_dir
 from review_content import extract_review_blocks
 
 
@@ -1461,6 +1461,7 @@ def parse_args(argv=None):
             "parallel preview folders; --production explicitly enables production roots."
         )
     )
+    parser.add_argument("--vault-dir", default=None)
     parser.add_argument("--output-dir", default=DEFAULT_OUTPUT_DIR)
     parser.add_argument("--review-dir", default=DEFAULT_REVIEW_DIR)
     parser.add_argument("--metadata-file", default=DEFAULT_METADATA_FILE)
@@ -1571,12 +1572,13 @@ def _main_unlocked(argv=None):
 
     args = parse_args(argv)
     script_dir = os.path.dirname(os.path.abspath(__file__))
-    vault_dir = resolve_workspace_dir(script_dir)
+    vault_dir = os.path.abspath(args.vault_dir) if args.vault_dir else resolve_workspace_dir(script_dir)
+    state_dir = resolve_workspace_state_dir(script_dir, vault_dir)
     rules_path = os.path.join(vault_dir, "Classification_Rules.md")
     daily_logs_dir = os.path.join(vault_dir, "Daily_Logs")
-    metadata_path = os.path.join(script_dir, args.metadata_file)
-    report_path = os.path.join(script_dir, "reports", "hierarchical_classification_report.md")
-    source_id_backup_root = os.path.join(script_dir, "source_id_backups")
+    metadata_path = os.path.join(state_dir, args.metadata_file)
+    report_path = os.path.join(state_dir, "reports", "hierarchical_classification_report.md")
+    source_id_backup_root = os.path.join(state_dir, "source_id_backups")
 
     target_error = validate_output_targets(args)
     if target_error:
@@ -1610,7 +1612,7 @@ def _main_unlocked(argv=None):
 
     try:
         previous_metadata = load_metadata(metadata_path)
-        legacy_metadata = load_metadata(os.path.join(script_dir, "organizer_metadata.json"))
+        legacy_metadata = load_metadata(os.path.join(state_dir, "organizer_metadata.json"))
     except StateFileError as exc:
         print(f"Error: {exc}")
         print("Existing Subject, Topic_Reviews, and metadata were left unchanged.")
@@ -1943,7 +1945,7 @@ def main(argv=None):
         return _main_unlocked(argv)
 
     script_dir = os.path.dirname(os.path.abspath(__file__))
-    vault_dir = resolve_workspace_dir(script_dir)
+    vault_dir = os.path.abspath(args.vault_dir) if args.vault_dir else resolve_workspace_dir(script_dir)
     if args.production:
         operation = "classification-production"
     elif args.dry_run:

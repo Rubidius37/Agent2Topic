@@ -797,7 +797,7 @@ def main(argv=None):
             if args.dry_run:
                 extra.append("--dry-run")
             if args.rebuild_ids:
-                extra.append("--rebuild-ids")
+                extra.append("--rebuild-source-ids")
             res = run_production_classifier(vault_dir, extra_args=extra)
             metadata = load_metadata(metadata_path) if os.path.isfile(metadata_path) else {}
             payload = {

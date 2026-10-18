@@ -251,6 +251,27 @@ class AgentCliTests(unittest.TestCase):
             self.assertEqual(code, 0)
             self.assertEqual(status_after["needs_review_count"], 0)
 
+    def test_real_subprocess_classifier_on_external_vault_and_rebuild_ids(self):
+        code, res = self.run_cli_json(
+            "append",
+            "--path",
+            "Projects/Alpha/Testing",
+            "--title",
+            "End-to-end subprocess test",
+            "--date",
+            "2026-10-18",
+            "--content",
+            "Verified subprocess classifier with --vault-dir.",
+        )
+        self.assertEqual(code, 0)
+        self.assertTrue(
+            os.path.isfile(os.path.join(self.vault, "scripts", "organizer_metadata.json"))
+        )
+
+        code, rebuilt = self.run_cli_json("update", "--rebuild-ids")
+        self.assertEqual(code, 0)
+        self.assertTrue(rebuilt["rebuild_ids"])
+
 
 if __name__ == "__main__":
     unittest.main()
