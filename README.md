@@ -86,6 +86,43 @@ pip install -e .
 
 ---
 
+## Installation & Updating
+
+Because user data lives in `Workspace/` (ignored by Git and separate from the CLI package), updating the tool never touches your notes.
+
+### Option A: `uv` or `pipx` (Recommended)
+```bash
+# Install
+uv tool install git+https://github.com/Rubidius37/Project_Agent.git
+# (or: pipx install git+https://github.com/Rubidius37/Project_Agent.git)
+
+# Upgrade to latest version
+uv tool upgrade pagent
+```
+
+### Option B: `git clone` + Editable Install
+```bash
+git clone https://github.com/Rubidius37/Project_Agent.git
+cd Project_Agent
+pip install -e .
+
+# Upgrade to latest version
+git pull --ff-only
+```
+
+### Check for Updates (Read-Only)
+`pagent` never performs background network calls or unprompted self-updates. You can manually check if a newer release tag exists on GitHub:
+```bash
+pagent version --check
+```
+
+### Publishing Releases & PyPI (Maintainer Guide)
+`.github/workflows/release.yml` is pre-configured:
+1. Pushing a version tag (`git tag v0.3.0 && git push origin v0.3.0`) runs the test suite, builds the Python wheel/sdist, verifies bundled `viewer_ui` assets, and publishes a **GitHub Release** with `SHA256SUMS.txt`.
+2. To enable automatic **PyPI** publishing later: register this repository as a [PyPI Trusted Publisher](https://docs.pypi.org/trusted-publishers/) (environment name: `pypi`) and set the GitHub repository variable `PYPI_ENABLED=true`.
+
+---
+
 ## Running Tests
 
 ```bash

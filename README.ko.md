@@ -42,6 +42,44 @@ AI 코딩·연구 에이전트(Codex, Claude Code, OpenCode)가 여러 세션에
 | `pagent classify --source-id <ID> --path "..."` | 특정 `Source ID`에 수동 `Category:` 지정 또는 해제(`--clear-manual`) |
 | `pagent source --id <ID> [--max-chars N] [--json]` | 특정 `Source ID`의 원본 일지 위치, 메타데이터(`kind`, `files`, `commit`), 본문 전문 역추적 |
 | `pagent view [--port 8000] [--refresh]` | 사람 열람용 순수 읽기 전용 로컬 웹 뷰어 실행 |
+| `pagent version [--check] [--json]` | 현재 설치된 버전 확인 및 원격 GitHub 최신 릴리스 존재 여부 수동 조회 |
+
+---
+
+## 설치 및 업데이트 방법
+
+사용자 데이터(`Workspace/`)와 프로그램 코드가 완전히 분리되어 있으므로, 도구를 업데이트해도 작성한 일지나 분류 규칙은 절대 덮어써지지 않습니다.
+
+### 방법 A: `uv` 또는 `pipx` 사용 (권장)
+```powershell
+# 최초 설치
+uv tool install git+https://github.com/Rubidius37/Project_Agent.git
+# (또는: pipx install git+https://github.com/Rubidius37/Project_Agent.git)
+
+# 최신 버전으로 업데이트
+uv tool upgrade pagent
+```
+
+### 방법 B: `git clone` + `pip install -e .`
+```powershell
+git clone https://github.com/Rubidius37/Project_Agent.git
+cd Project_Agent
+pip install -e .
+
+# 최신 버전으로 업데이트
+git pull --ff-only
+```
+
+### 수동 버전 확인 (`pagent version --check`)
+`pagent`는 백그라운드에서 몰래 네트워크 통신을 하거나 자동 설치를 수행하지 않습니다. 새 버전이 나왔는지 확인하고 싶을 때만 아래 명령을 실행하세요:
+```powershell
+pagent version --check
+```
+
+### 릴리스 및 추후 PyPI 자동 배포 안내 (유지보수자용)
+`.github/workflows/release.yml`에 배포 파이프라인이 미리 준비되어 있습니다:
+1. **GitHub Release 자동 생성**: `git tag v0.3.0 && git push origin v0.3.0`으로 태그를 푸시하면 테스트 검증 후 `.whl`, `.tar.gz`, `SHA256SUMS.txt`가 첨부된 GitHub Release가 자동 생성됩니다.
+2. **추후 PyPI 공개 배포 활성화**: 나중에 정식 이름으로 PyPI에 배포하고 싶을 때는 [PyPI Trusted Publisher](https://docs.pypi.org/trusted-publishers/)에 저장소를 등록(환경 이름: `pypi`)한 뒤, GitHub 저장소 변수(`Settings > Secrets and variables > Actions > Variables`)에 `PYPI_ENABLED=true`만 추가하면 태그 푸시 시 PyPI까지 자동 업로드됩니다.
 
 ---
 

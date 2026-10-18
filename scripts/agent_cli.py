@@ -7,6 +7,8 @@ import os
 import re
 import subprocess
 import sys
+import urllib.error
+import urllib.request
 
 from atomic_io import StateFileError, atomic_write_text, filesystem_path
 from document_utils import extract_entry_metadata, normalize_rel_path, source_date_key
@@ -51,6 +53,8 @@ from workspace_paths import (
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_VAULT_DIR = resolve_workspace_dir(SCRIPT_DIR)
+PAGENT_VERSION = "0.3.0"
+DEFAULT_GITHUB_REPO = "Rubidius37/Project_Agent"
 
 DEFAULT_CONTEXT_MAX_CHARS = 12000
 DEFAULT_REVIEW_ENTRY_CHARS = 1200
@@ -765,13 +769,84 @@ def search_workspace_entries(
     }
 
 
+def _parse_semver_tuple(raw_version):
+    cleaned = str(raw_version or "").strip().lstrip("vV")
+    nums = re.findall(r"\d+", cleaned)
+    return tuple(int(n) for n in nums[:4]) if nums else (0,)
+
+
+def check_remote_version(repo=None, timeout=5):
+    target_repo = (
+        str(repo or "").strip()
+        or os.environ.get("PAGENT_GITHUB_REPO", "").strip()
+        or DEFAULT_GITHUB_REPO
+    )
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", target_repo):
+        raise ValueError(f"Invalid GitHub repository identifier: {target_repo}")
+    url = f"https://api.github.com/repos/{target_repo}/releases/latest"
+    req = urllib.request.Request(
+        url,
+        headers={
+            "Accept": "application/vnd.github+json",
+            "User-Agent": f"pagent/{PAGENT_VERSION}",
+        },
+        method="GET",
+    )
+    upgrade_cmds = [
+        "uv tool upgrade pagent",
+        "pipx upgrade pagent",
+        "git pull --ff-only",
+    ]
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        tag_name = str(data.get("tag_name") or "").strip()
+        latest_clean = tag_name.lstrip("vV") or PAGENT_VERSION
+        update_available = _parse_semver_tuple(latest_clean) > _parse_semver_tuple(PAGENT_VERSION)
+        return {
+            "version": PAGENT_VERSION,
+            "checked_remote": True,
+            "repo": target_repo,
+            "latest_version": latest_clean,
+            "latest_tag": tag_name,
+            "update_available": update_available,
+            "release_url": data.get("html_url") or f"https://github.com/{target_repo}/releases",
+            "upgrade_commands": upgrade_cmds,
+        }
+    except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError, OSError, ValueError) as exc:
+        return {
+            "version": PAGENT_VERSION,
+            "checked_remote": False,
+            "repo": target_repo,
+            "latest_version": None,
+            "update_available": False,
+            "check_error": str(exc),
+            "upgrade_commands": upgrade_cmds,
+        }
+
+
 def build_parser():
     parser = argparse.ArgumentParser(
         prog="pagent",
         description="Deterministic Markdown work-history compiler & viewer for AI agents and humans.",
     )
+    parser.add_argument(
+        "--version",
+        "-V",
+        action="version",
+        version=f"pagent {PAGENT_VERSION}",
+    )
     parser.add_argument("--vault-dir", default=None, help="Override Workspace directory path.")
     sub = parser.add_subparsers(dest="subcommand", required=True)
+
+    p_version = sub.add_parser("version", help="Show installed version and optionally check for newer releases.")
+    p_version.add_argument(
+        "--check",
+        action="store_true",
+        help="Check GitHub Releases API for a newer version (read-only, never auto-installs).",
+    )
+    p_version.add_argument("--repo", default=None, help="Override GitHub owner/repo for --check.")
+    p_version.add_argument("--json", action="store_true")
 
     p_init = sub.add_parser("init", help="Initialize Workspace folders and Classification_Rules.md.")
     p_init.add_argument("--here", action="store_true", help="Initialize ./Workspace in the current working directory.")
@@ -886,6 +961,37 @@ def main(argv=None):
     metadata_path = os.path.join(state_dir, "organizer_metadata.json")
 
     try:
+        if args.subcommand == "version":
+            if args.check:
+                info = check_remote_version(repo=args.repo)
+            else:
+                info = {
+                    "version": PAGENT_VERSION,
+                    "checked_remote": False,
+                    "upgrade_commands": [
+                        "uv tool upgrade pagent",
+                        "pipx upgrade pagent",
+                        "git pull --ff-only",
+                    ],
+                }
+            payload = {"status": "ok", **info}
+            lines = [f"pagent {PAGENT_VERSION}"]
+            if args.check:
+                if info.get("checked_remote"):
+                    if info.get("update_available"):
+                        lines.append(
+                            f"Update available: v{info['latest_version']} ({info['release_url']})"
+                        )
+                        lines.append(
+                            f"Upgrade via: {'  |  '.join(info['upgrade_commands'])}"
+                        )
+                    else:
+                        lines.append(f"Up to date (latest: v{info['latest_version']}).")
+                else:
+                    lines.append(f"Remote check skipped/unavailable: {info.get('check_error')}")
+            _emit(payload, args.json, lines)
+            return 0
+
         if args.subcommand == "init":
             info = ensure_workspace_initialized(vault_dir)
             payload = {"status": "ok", **info}

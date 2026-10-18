@@ -346,6 +346,35 @@ class AgentCliTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertTrue(rebuilt["rebuild_ids"])
 
+    def test_version_subcommand_and_remote_update_check(self):
+        code, ver, _ = self.run_cli_json("version")
+        self.assertEqual(code, 0)
+        self.assertEqual(ver["version"], agent_cli.PAGENT_VERSION)
+        self.assertFalse(ver["checked_remote"])
+
+        class FakeResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def read(self):
+                return json.dumps(
+                    {
+                        "tag_name": "v9.9.0",
+                        "html_url": "https://github.com/Rubidius37/Project_Agent/releases/tag/v9.9.0",
+                    }
+                ).encode("utf-8")
+
+        with patch.object(agent_cli.urllib.request, "urlopen", return_value=FakeResponse()):
+            code, checked, _ = self.run_cli_json("version", "--check")
+            self.assertEqual(code, 0)
+            self.assertTrue(checked["checked_remote"])
+            self.assertTrue(checked["update_available"])
+            self.assertEqual(checked["latest_version"], "9.9.0")
+            self.assertIn("uv tool upgrade pagent", checked["upgrade_commands"])
+
 
 if __name__ == "__main__":
     unittest.main()

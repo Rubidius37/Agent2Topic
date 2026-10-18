@@ -15,7 +15,9 @@ dependencies = []
 pagent = "agent_cli:main"
 
 [tool.setuptools]
+include-package-data = true
 package-dir = {"" = "scripts"}
+packages = ["viewer_ui"]
 py-modules = [
     "agent_cli",
     "atomic_io",
@@ -29,3 +31,6 @@ py-modules = [
     "workspace_paths",
     "workspace_viewer",
 ]
+
+[tool.setuptools.package-data]
+viewer_ui = ["*.html", "*.css", "*.js"]
