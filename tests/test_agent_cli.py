@@ -21,6 +21,7 @@ RULES = """\
 | Level 1 | Level 2 | Level 3 | Level 4 | Level 5 | Keywords |
 | :--- | :--- | :--- | :--- | :--- | :--- |
 | Projects | Alpha | Testing | | | alpha test |
+| | | Planning | | | alpha plan |
 | Knowledge | Architecture | | | | arch |
 """
 
@@ -79,7 +80,7 @@ class AgentCliTests(unittest.TestCase):
     def test_rules_and_rule_add_extend_markdown_table(self):
         code, data = self.run_cli_json("rules")
         self.assertEqual(code, 0)
-        self.assertEqual(data["count"], 5)
+        self.assertEqual(data["count"], 6)
 
         code, added = self.run_cli_json(
             "rule-add",
@@ -126,6 +127,89 @@ class AgentCliTests(unittest.TestCase):
             self.assertEqual(code, 0)
             self.assertEqual(src["source_id"], source_id)
 
+    def test_search_by_file_kind_query_and_smart_same_topic_merge(self):
+        with patch.object(agent_cli, "run_production_classifier", side_effect=inprocess_classifier):
+            # First append under Projects/Alpha/Testing with explicit --files and --kind
+            code, first = self.run_cli_json(
+                "append",
+                "--path",
+                "Projects/Alpha/Testing",
+                "--title",
+                "Atomic write verification",
+                "--kind",
+                "bugfix",
+                "--files",
+                "scripts/review_renderer.py, scripts/atomic_io.py",
+                "--date",
+                "2026-10-18",
+                "--content",
+                "Replaced open() with atomic_write_text.",
+            )
+            self.assertEqual(code, 0)
+            self.assertFalse(first["merged_into_last_unit"])
+
+            # Second append on same date and same topic -> merges into last unit without repeating H1-H3
+            code, second = self.run_cli_json(
+                "append",
+                "--path",
+                "Projects/Alpha/Testing",
+                "--title",
+                "Follow-up edge case",
+                "--date",
+                "2026-10-18",
+                "--content",
+                "Also checked `scripts/workspace_viewer.py` for path traversal.",
+            )
+            self.assertEqual(code, 0)
+            self.assertTrue(second["merged_into_last_unit"])
+
+            # Third append on same date under sibling topic Projects/Alpha/Planning -> emits only ### Planning
+            code, third = self.run_cli_json(
+                "append",
+                "--path",
+                "Projects/Alpha/Planning",
+                "--title",
+                "Roadmap decision",
+                "--kind",
+                "decision",
+                "--date",
+                "2026-10-18",
+                "--content",
+                "Adopted read-only local web viewer architecture.",
+            )
+            self.assertEqual(code, 0)
+            self.assertFalse(third["merged_into_last_unit"])
+
+            log_file = os.path.join(self.vault, "Daily_Logs", "2026-10-18.md")
+            with open(log_file, "r", encoding="utf-8") as f:
+                raw_log = f.read()
+            self.assertEqual(raw_log.count("# Projects"), 1)
+            self.assertEqual(raw_log.count("## Alpha"), 1)
+            self.assertIn("### Planning", raw_log)
+
+            # Search by explicit file
+            code, by_file = self.run_cli_json("search", "--file", "review_renderer.py")
+            self.assertEqual(code, 0)
+            self.assertEqual(by_file["total_matches"], 1)
+            self.assertIn("scripts/review_renderer.py", by_file["results"][0]["files"])
+
+            # Search by backticked file in prose
+            code, by_inline_file = self.run_cli_json("search", "--file", "workspace_viewer.py")
+            self.assertEqual(code, 0)
+            self.assertEqual(by_inline_file["total_matches"], 1)
+
+            # Search by kind
+            code, by_kind = self.run_cli_json("search", "--kind", "decision")
+            self.assertEqual(code, 0)
+            self.assertEqual(by_kind["total_matches"], 1)
+            self.assertEqual(by_kind["results"][0]["categories"], [["Projects", "Alpha", "Planning"]])
+
+            # Search by keyword query
+            code, by_query = self.run_cli_json("search", "--query", "atomic_write_text")
+            self.assertEqual(code, 0)
+            self.assertEqual(by_query["total_matches"], 1)
+            self.assertTrue(by_query["related_reviews"])
+
     def test_append_with_create_rule_and_manual_classify(self):
         with patch.object(agent_cli, "run_production_classifier", side_effect=inprocess_classifier):
             code, res = self.run_cli_json(
@@ -141,7 +225,6 @@ class AgentCliTests(unittest.TestCase):
             self.assertEqual(code, 0)
             self.assertEqual(res["category_path"], ["Projects", "Beta", "Benchmarks"])
 
-            # Write an unclassified note and classify it via CLI
             unclassified_log = os.path.join(self.vault, "Daily_Logs", "2026-10-19.md")
             with open(unclassified_log, "w", encoding="utf-8") as file_obj:
                 file_obj.write("# Unknown Heading\nMystery note needing manual triage.\n")

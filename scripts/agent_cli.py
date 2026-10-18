@@ -12,11 +12,13 @@ from document_utils import normalize_rel_path, source_date_key
 from hierarchical_classifier import (
     CATEGORY_LEVELS,
     HEADING_RE,
+    SOURCE_ID_RE,
     is_category_header,
     is_markdown_blockquote_line,
     is_table_divider,
     load_metadata,
     normalize_name,
+    parse_markdown_into_units,
     parse_rules_from_markdown,
     source_lines_with_code_context,
     source_unit_fingerprint,
@@ -37,11 +39,22 @@ from review_ops import (
     remove_manual_categories,
     run_production_classifier,
 )
-from workspace_paths import resolve_workspace_dir, resolve_workspace_state_dir
+from workspace_paths import (
+    WORKSPACE_DIRECTORY_NAME,
+    resolve_active_workspace_dir,
+    resolve_workspace_dir,
+    resolve_workspace_state_dir,
+)
 
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_VAULT_DIR = resolve_workspace_dir(SCRIPT_DIR)
+
+KIND_LINE_RE = re.compile(r"^\*\*Kind\*\*\s*:\s*(.+?)\s*$", re.IGNORECASE)
+FILES_LINE_RE = re.compile(r"^\*\*Files\*\*\s*:\s*(.+?)\s*$", re.IGNORECASE)
+INLINE_FILE_RE = re.compile(
+    r"`([A-Za-z0-9_./\\-]+\.[A-Za-z0-9]{1,10})`"
+)
 
 DEFAULT_RULES_TEMPLATE = """\
 # Classification Rules
@@ -94,6 +107,57 @@ def sanitize_agent_body_headings(content):
     return "".join(out)
 
 
+def parse_file_list(raw_files):
+    if not raw_files:
+        return []
+    if isinstance(raw_files, (list, tuple)):
+        chunks = []
+        for item in raw_files:
+            chunks.extend(str(item or "").split(","))
+    else:
+        chunks = str(raw_files).split(",")
+    seen = set()
+    result = []
+    for chunk in chunks:
+        cleaned = normalize_rel_path(chunk.strip().strip("`\"'")).lstrip("./")
+        if cleaned and cleaned.casefold() not in seen:
+            seen.add(cleaned.casefold())
+            result.append(cleaned)
+    return result
+
+
+def extract_entry_metadata(content):
+    """Extract Kind and Files metadata (explicit or backticked file paths) from unit content."""
+    kind = None
+    files = []
+    seen_files = set()
+
+    def add_file(candidate):
+        norm = normalize_rel_path(candidate.strip().strip("`\"'")).lstrip("./")
+        if norm and not norm.startswith(("http://", "https://")) and norm.casefold() not in seen_files:
+            seen_files.add(norm.casefold())
+            files.append(norm)
+
+    for line, in_code in source_lines_with_code_context(str(content or "")):
+        if in_code:
+            continue
+        stripped = line.strip()
+        if kind is None:
+            m_kind = KIND_LINE_RE.match(stripped)
+            if m_kind:
+                kind = m_kind.group(1).strip().strip("`").lower()
+                continue
+        m_files = FILES_LINE_RE.match(stripped)
+        if m_files:
+            for item in m_files.group(1).split(","):
+                add_file(item)
+            continue
+        for match in INLINE_FILE_RE.finditer(line):
+            add_file(match.group(1))
+
+    return {"kind": kind, "files": files}
+
+
 def ensure_workspace_initialized(vault_dir):
     vault_real = os.path.realpath(vault_dir)
     daily_dir = os.path.join(vault_real, "Daily_Logs")
@@ -104,7 +168,8 @@ def ensure_workspace_initialized(vault_dir):
     for folder in (vault_real, daily_dir, attachments_dir):
         if not os.path.isdir(filesystem_path(folder)):
             os.makedirs(filesystem_path(folder), exist_ok=True)
-            created.append(normalize_rel_path(os.path.relpath(folder, vault_real)))
+            rel = normalize_rel_path(os.path.relpath(folder, vault_real))
+            created.append(rel if rel != "." else WORKSPACE_DIRECTORY_NAME)
 
     if not os.path.isfile(filesystem_path(rules_path)):
         atomic_write_text(rules_path, DEFAULT_RULES_TEMPLATE)
@@ -232,6 +297,55 @@ def add_rule_to_markdown(rules_filepath, raw_path, raw_keywords=""):
     }
 
 
+def _determine_headings_to_emit(existing_filepath, tree, resolved, merge_same_topic):
+    """Determine which H1-H5 headings need to be written when appending to an existing log."""
+    full_headings = [f"{'#' * (idx + 1)} {part}" for idx, part in enumerate(resolved)]
+    if not merge_same_topic or not os.path.isfile(filesystem_path(existing_filepath)):
+        return full_headings, False
+
+    try:
+        _log_name, units = parse_markdown_into_units(existing_filepath, tree)
+    except Exception:
+        return full_headings, False
+
+    if not units:
+        return full_headings, False
+
+    last_unit = units[-1]
+    structural_headings_in_last = sum(
+        1
+        for line, in_code in source_lines_with_code_context(last_unit.content)
+        if not in_code and HEADING_RE.match(line)
+    )
+    if structural_headings_in_last != 1:
+        return full_headings, False
+
+    last_cat = tuple(last_unit.category_path)
+    last_head = tuple(last_unit.heading_path)
+    if len(last_cat) != len(last_head) or not all(
+        normalize_name(a) == normalize_name(b) for a, b in zip(last_cat, last_head)
+    ):
+        return full_headings, False
+
+    # Exact same category path at the tail of today's log -> merge directly into last unit
+    if len(last_cat) == len(resolved) and all(
+        normalize_name(a) == normalize_name(b) for a, b in zip(last_cat, resolved)
+    ):
+        return [], True
+
+    # Shared prefix -> emit only diverging headings from common prefix onwards
+    common_len = 0
+    for a, b in zip(last_cat, resolved):
+        if normalize_name(a) == normalize_name(b):
+            common_len += 1
+        else:
+            break
+    if common_len >= 1 and common_len < len(resolved):
+        return full_headings[common_len:], False
+
+    return full_headings, False
+
+
 def append_log_entry(
     vault_dir,
     rules_path,
@@ -242,6 +356,9 @@ def append_log_entry(
     log_file=None,
     auto_create_rule=False,
     escape_headings=True,
+    files=None,
+    kind=None,
+    merge_same_topic=True,
 ):
     parts = split_category_path(raw_category_path)
     tree = parse_rules_from_markdown(rules_path)
@@ -286,15 +403,35 @@ def append_log_entry(
     if escape_headings:
         body = sanitize_agent_body_headings(body)
 
-    heading_lines = [
-        f"{'#' * (idx + 1)} {part}" for idx, part in enumerate(resolved)
-    ]
+    normalized_files = parse_file_list(files)
+    normalized_kind = str(kind or "").strip().lower() or None
+
+    meta_lines = []
+    if normalized_kind:
+        meta_lines.append(f"**Kind**: {normalized_kind}")
+    if normalized_files:
+        formatted_files = ", ".join(f"`{f}`" for f in normalized_files)
+        meta_lines.append(f"**Files**: {formatted_files}")
+    if meta_lines:
+        body = "\n".join(meta_lines) + "\n\n" + body
+
+    heading_lines, merged_into_last = _determine_headings_to_emit(
+        target_path, tree, resolved, merge_same_topic=merge_same_topic
+    )
+
     if title and normalize_name(title) != normalize_name(resolved[-1]):
         clean_title = str(title).strip()
         if clean_title:
             heading_lines.append(f"###### {clean_title}")
+    elif merged_into_last and title:
+        clean_title = str(title).strip()
+        if clean_title:
+            heading_lines.append(f"###### {clean_title}")
 
-    section_text = "\n".join(heading_lines) + "\n\n" + body + "\n"
+    if heading_lines:
+        section_text = "\n".join(heading_lines) + "\n\n" + body + "\n"
+    else:
+        section_text = body + "\n"
 
     existing = ""
     if os.path.isfile(filesystem_path(target_path)):
@@ -318,7 +455,22 @@ def append_log_entry(
         "log_path": rel_log_path,
         "category_path": list(resolved),
         "title": title or resolved[-1],
+        "kind": normalized_kind,
+        "files": normalized_files,
+        "merged_into_last_unit": merged_into_last,
     }
+
+
+def _find_review_path_for_category(vault_dir, category_tuple):
+    review_dir = os.path.join(vault_dir, "Topic_Reviews", *category_tuple)
+    if os.path.isdir(filesystem_path(review_dir)):
+        for fname in sorted(os.listdir(filesystem_path(review_dir))):
+            if fname.casefold().endswith(".md"):
+                full_rev = os.path.realpath(os.path.join(review_dir, fname))
+                return normalize_rel_path(
+                    os.path.relpath(full_rev, os.path.realpath(vault_dir))
+                )
+    return None
 
 
 def query_topic_context(
@@ -361,6 +513,7 @@ def query_topic_context(
             excerpt = unit.content
         except Exception:
             excerpt = ""
+        meta = extract_entry_metadata(excerpt)
         matched_entries.append(
             {
                 "source_id": source_id,
@@ -368,6 +521,8 @@ def query_topic_context(
                 "source_path": source_rel,
                 "source_line": entry.get("source_line", 0),
                 "title": entry.get("source_heading", ""),
+                "kind": meta["kind"],
+                "files": meta["files"],
                 "categories": [list(cat) for cat in matched_cats],
                 "generated_paths": entry.get("generated_paths", []),
                 "content": excerpt,
@@ -379,19 +534,12 @@ def query_topic_context(
         reverse=True,
     )
 
-    review_rel_path = None
+    review_rel_path = _find_review_path_for_category(vault_dir, resolved)
     review_content = None
-    review_dir = os.path.join(vault_dir, "Topic_Reviews", *resolved)
-    if os.path.isdir(filesystem_path(review_dir)):
-        for fname in sorted(os.listdir(filesystem_path(review_dir))):
-            if fname.casefold().endswith(".md"):
-                full_rev = os.path.realpath(os.path.join(review_dir, fname))
-                review_rel_path = normalize_rel_path(
-                    os.path.relpath(full_rev, os.path.realpath(vault_dir))
-                )
-                with open(filesystem_path(full_rev), "r", encoding="utf-8") as file_obj:
-                    review_content = file_obj.read()
-                break
+    if review_rel_path:
+        full_rev = os.path.join(vault_dir, *review_rel_path.split("/"))
+        with open(filesystem_path(full_rev), "r", encoding="utf-8") as file_obj:
+            review_content = file_obj.read()
 
     return {
         "topic_path": list(resolved),
@@ -399,6 +547,128 @@ def query_topic_context(
         "review_markdown": review_content,
         "total_entries": len(matched_entries),
         "entries": matched_entries[: max(0, int(limit))],
+    }
+
+
+def search_workspace_entries(
+    vault_dir,
+    metadata_path,
+    rules_path,
+    query=None,
+    file_filter=None,
+    kind_filter=None,
+    topic_filter=None,
+    limit=10,
+):
+    tree = parse_rules_from_markdown(rules_path)
+    norm_topic_prefix = None
+    if topic_filter:
+        parts = split_category_path(topic_filter)
+        resolved = tree.resolve_manual_path(parts) or tuple(parts)
+        norm_topic_prefix = tuple(normalize_name(p) for p in resolved)
+
+    query_terms = [t.casefold() for t in str(query or "").split() if t.strip()]
+    norm_file_filter = (
+        normalize_rel_path(str(file_filter or "").strip()).lstrip("./").casefold()
+        if file_filter
+        else None
+    )
+    norm_kind_filter = str(kind_filter or "").strip().casefold() if kind_filter else None
+
+    metadata = load_metadata(metadata_path) if os.path.isfile(metadata_path) else {}
+    entries = metadata.get("entries", {}) if isinstance(metadata, dict) else {}
+
+    results = []
+    related_reviews = []
+    seen_reviews = set()
+
+    for source_id, entry in entries.items():
+        if not isinstance(entry, dict):
+            continue
+        matched_cats = [
+            tuple(m.get("path", ()))
+            for m in entry.get("matched_categories", [])
+            if isinstance(m, dict) and m.get("path")
+        ]
+        if norm_topic_prefix is not None:
+            hit_topic = any(
+                len(norm_topic_prefix) <= len(cat)
+                and tuple(normalize_name(c) for c in cat[: len(norm_topic_prefix)]) == norm_topic_prefix
+                for cat in matched_cats
+            )
+            if not hit_topic:
+                continue
+
+        source_rel = entry.get("source_path", "")
+        content = ""
+        try:
+            _fp, _rel, _units, _idx, unit = locate_source_unit(
+                vault_dir, tree, source_id, entry
+            )
+            content = unit.content
+        except Exception:
+            content = ""
+
+        clean_content = SOURCE_ID_RE.sub("", content).strip()
+        meta = extract_entry_metadata(clean_content)
+
+        if norm_kind_filter and (meta["kind"] or "").casefold() != norm_kind_filter:
+            continue
+
+        if norm_file_filter:
+            file_hit = any(norm_file_filter in f.casefold() for f in meta["files"]) or (
+                norm_file_filter in normalize_rel_path(clean_content).casefold()
+            )
+            if not file_hit:
+                continue
+
+        if query_terms:
+            haystack = " ".join(
+                [
+                    entry.get("source_heading", ""),
+                    " ".join("/".join(cat) for cat in matched_cats),
+                    " ".join(meta["files"]),
+                    meta["kind"] or "",
+                    clean_content,
+                ]
+            ).casefold()
+            if not all(term in haystack for term in query_terms):
+                continue
+
+        for cat in matched_cats:
+            rev = _find_review_path_for_category(vault_dir, cat)
+            if rev and rev not in seen_reviews:
+                seen_reviews.add(rev)
+                related_reviews.append(rev)
+
+        results.append(
+            {
+                "source_id": source_id,
+                "date": source_date_key(source_rel),
+                "source_path": source_rel,
+                "source_line": entry.get("source_line", 0),
+                "title": entry.get("source_heading", ""),
+                "kind": meta["kind"],
+                "files": meta["files"],
+                "categories": [list(cat) for cat in matched_cats],
+                "generated_paths": entry.get("generated_paths", []),
+                "content": clean_content,
+            }
+        )
+
+    results.sort(
+        key=lambda item: (item["date"], item["source_path"], item["source_line"]),
+        reverse=True,
+    )
+
+    return {
+        "query": query or "",
+        "file": file_filter or "",
+        "kind": kind_filter or "",
+        "topic": topic_filter or "",
+        "total_matches": len(results),
+        "related_reviews": sorted(related_reviews),
+        "results": results[: max(0, int(limit))],
     }
 
 
@@ -411,6 +681,7 @@ def build_parser():
     sub = parser.add_subparsers(dest="subcommand", required=True)
 
     p_init = sub.add_parser("init", help="Initialize Workspace folders and Classification_Rules.md.")
+    p_init.add_argument("--here", action="store_true", help="Initialize ./Workspace in the current working directory.")
     p_init.add_argument("--json", action="store_true")
 
     p_update = sub.add_parser("update", help="Compile Daily_Logs into Subject/ and Topic_Reviews/ via Python classifier.")
@@ -432,9 +703,12 @@ def build_parser():
     p_append.add_argument("--title", default=None, help="Optional subsection title.")
     p_append.add_argument("--content", default=None, help="Markdown body content.")
     p_append.add_argument("--stdin", action="store_true", help="Read Markdown body content from stdin.")
+    p_append.add_argument("--files", action="append", default=[], help="Related code/file paths (comma-separated or repeated).")
+    p_append.add_argument("--kind", default=None, help="Entry type (e.g. decision, bugfix, experiment, refactor, note).")
     p_append.add_argument("--date", default=None, help="Log date (YYYY-MM-DD). Defaults to today.")
     p_append.add_argument("--log-file", default=None, help="Specific filename under Daily_Logs/.")
     p_append.add_argument("--create-rule", action="store_true", help="Automatically add the path to Classification_Rules.md if missing.")
+    p_append.add_argument("--no-merge", action="store_true", help="Always write full H1-H5 headings instead of merging with the tail section.")
     p_append.add_argument("--no-escape-headings", action="store_true", help="Do not demote H1-H5 headings inside body content.")
     p_append.add_argument("--no-update", action="store_true", help="Write log entry without running the classifier.")
     p_append.add_argument("--json", action="store_true")
@@ -443,6 +717,14 @@ def build_parser():
     p_context.add_argument("--topic", required=True, help="Topic path prefix (e.g. 'Projects/Alpha').")
     p_context.add_argument("--limit", type=int, default=5, help="Max individual entries to return.")
     p_context.add_argument("--json", action="store_true")
+
+    p_search = sub.add_parser("search", help="Search entries by keyword query, modified file path, kind, or topic.")
+    p_search.add_argument("--query", "-q", default=None, help="Keyword query across headings, categories, and body.")
+    p_search.add_argument("--file", "-f", default=None, help="Filter by referenced/modified file path (e.g. 'review_renderer.py').")
+    p_search.add_argument("--kind", "-k", default=None, help="Filter by entry kind (e.g. 'decision', 'bugfix').")
+    p_search.add_argument("--topic", "-t", default=None, help="Optional topic prefix filter.")
+    p_search.add_argument("--limit", type=int, default=10, help="Max matching entries to return (default: 10).")
+    p_search.add_argument("--json", action="store_true")
 
     p_status = sub.add_parser("status", help="Show classification statistics and items needing review.")
     p_status.add_argument("--json", action="store_true")
@@ -482,7 +764,15 @@ def main(argv=None):
 
     parser = build_parser()
     args = parser.parse_args(argv)
-    vault_dir = os.path.abspath(args.vault_dir) if args.vault_dir else DEFAULT_VAULT_DIR
+    explicit_vault = args.vault_dir
+    if args.subcommand == "init" and getattr(args, "here", False) and not explicit_vault:
+        explicit_vault = os.path.join(os.getcwd(), WORKSPACE_DIRECTORY_NAME)
+
+    vault_dir = resolve_active_workspace_dir(
+        SCRIPT_DIR,
+        explicit_vault_dir=explicit_vault,
+        for_init=(args.subcommand == "init"),
+    )
     rules_path = os.path.join(vault_dir, "Classification_Rules.md")
     state_dir = resolve_workspace_state_dir(SCRIPT_DIR, vault_dir)
     metadata_path = os.path.join(state_dir, "organizer_metadata.json")
@@ -578,6 +868,9 @@ def main(argv=None):
                     log_file=args.log_file,
                     auto_create_rule=args.create_rule,
                     escape_headings=not args.no_escape_headings,
+                    files=args.files,
+                    kind=args.kind,
+                    merge_same_topic=not args.no_merge,
                 )
                 rebuild = {"ok": True}
                 if not args.no_update:
@@ -610,6 +903,31 @@ def main(argv=None):
             ]
             if ctx["review_markdown"]:
                 lines.extend(["", ctx["review_markdown"].rstrip()])
+            _emit(payload, args.json, lines)
+            return 0
+
+        if args.subcommand == "search":
+            res = search_workspace_entries(
+                vault_dir,
+                metadata_path,
+                rules_path,
+                query=args.query,
+                file_filter=args.file,
+                kind_filter=args.kind,
+                topic_filter=args.topic,
+                limit=args.limit,
+            )
+            payload = {"status": "ok", **res}
+            lines = [f"Matches: {res['total_matches']}"]
+            if res["related_reviews"]:
+                lines.append(f"Related reviews: {', '.join(res['related_reviews'])}")
+            for item in res["results"]:
+                cat_str = " > ".join(item["categories"][0]) if item["categories"] else "Unclassified"
+                kind_tag = f" [{item['kind']}]" if item.get("kind") else ""
+                files_tag = f" (files: {', '.join(item['files'])})" if item.get("files") else ""
+                lines.append(
+                    f"- [{item['source_id']}] {item['date']} · {cat_str} · {item['title']}{kind_tag}{files_tag}"
+                )
             _emit(payload, args.json, lines)
             return 0
 
@@ -675,9 +993,12 @@ def main(argv=None):
             _fp, _rel, _units, _idx, unit = locate_source_unit(
                 vault_dir, tree, args.id, entry
             )
+            meta = extract_entry_metadata(unit.content)
             payload = {
                 "status": "ok",
                 "source_id": args.id,
+                "kind": meta["kind"],
+                "files": meta["files"],
                 **entry,
                 "content": unit.content,
             }
@@ -691,9 +1012,7 @@ def main(argv=None):
         if args.subcommand == "view":
             import workspace_viewer
 
-            view_argv = ["--port", str(args.port)]
-            if args.vault_dir:
-                view_argv.extend(["--vault-dir", vault_dir])
+            view_argv = ["--port", str(args.port), "--vault-dir", vault_dir]
             if args.no_browser:
                 view_argv.append("--no-browser")
             if args.no_refresh:

@@ -13,6 +13,9 @@
       statsReviews: "리뷰",
       statsSubjects: "주제 문서",
       statsLogs: "원본 일지",
+      statsNeedsReview: "검토 필요",
+      tocTitle: "문서 내 목차",
+      tocEmpty: "목차 없음",
       loadError: "문서를 불러오지 못했습니다: ",
     },
     en: {
@@ -25,6 +28,9 @@
       statsReviews: "Reviews",
       statsSubjects: "Subjects",
       statsLogs: "Daily Logs",
+      statsNeedsReview: "Needs Review",
+      tocTitle: "On This Page",
+      tocEmpty: "No headings",
       loadError: "Could not load document: ",
     },
   };
@@ -59,6 +65,8 @@
     markdownView: document.getElementById("markdown-view"),
     rawView: document.getElementById("raw-view"),
     readerScroll: document.getElementById("reader-scroll"),
+    tocTitle: document.getElementById("toc-title"),
+    tocList: document.getElementById("toc-list"),
   };
 
   function t(key) {
@@ -72,6 +80,7 @@
     els.treeSearch.placeholder = t("searchPlaceholder");
     els.expandAll.textContent = t("expandAll");
     els.collapseAll.textContent = t("collapseAll");
+    els.tocTitle.textContent = t("tocTitle");
     if (!state.currentPath) {
       els.breadcrumb.textContent = t("selectPrompt");
     }
@@ -86,14 +95,26 @@
       counts[sec.id] = sec.count || 0;
     }
     const pills = [
-      `${t("statsReviews")} ${counts.Topic_Reviews || 0}`,
-      `${t("statsSubjects")} ${counts.Subject || 0}`,
-      `${t("statsLogs")} ${counts.Daily_Logs || 0}`,
+      { text: `${t("statsReviews")} ${counts.Topic_Reviews || 0}`, warn: false },
+      { text: `${t("statsSubjects")} ${counts.Subject || 0}`, warn: false },
+      { text: `${t("statsLogs")} ${counts.Daily_Logs || 0}`, warn: false },
     ];
-    for (const text of pills) {
+    const needsReview = Number(state.stats && state.stats.needs_review) || 0;
+    if (needsReview > 0) {
+      pills.push({ text: `${t("statsNeedsReview")} ${needsReview}`, warn: true });
+    }
+    for (const item of pills) {
       const span = document.createElement("span");
-      span.className = "stat-pill";
-      span.textContent = text;
+      span.className = "stat-pill" + (item.warn ? " warn" : "");
+      span.textContent = item.text;
+      if (item.warn) {
+        span.title = "Filter Unclassified / Needs Review";
+        span.addEventListener("click", () => {
+          state.searchQuery = "Unclassified";
+          els.treeSearch.value = "Unclassified";
+          renderTree();
+        });
+      }
       els.statsBar.appendChild(span);
     }
   }
@@ -277,7 +298,6 @@
 
     working = escapeHtml(working);
 
-    // Obsidian wikilink images: ![[path|alt]]
     working = working.replace(/!\[\[([^\]]+)\]\]/g, (_m, inner) => {
       const parts = inner.split("|");
       const rawPath = parts[0].trim();
@@ -288,14 +308,12 @@
       return `<img src="${escapeHtml(src)}" alt="${escapeHtml(alt)}">`;
     });
 
-    // Standard Markdown images: ![alt](url)
     working = working.replace(/!\[([^\]]*)\]\(([^)]+)\)/g, (_m, alt, rawUrl) => {
       const resolved = resolveRelativeTarget(currentFilePath, rawUrl);
       const src = resolved.external ? resolved.url : "/workspace/" + encodeURI(resolved.path);
       return `<img src="${escapeHtml(src)}" alt="${escapeHtml(alt)}">`;
     });
 
-    // Standard Markdown links: [label](url)
     working = working.replace(/\[((?:\\.|[^\]])*)\]\(([^)]+)\)/g, (_m, label, rawUrl) => {
       const cleanLabel = label.replace(/\\([\[\]\\])/g, "$1");
       const resolved = resolveRelativeTarget(currentFilePath, rawUrl);
@@ -336,6 +354,7 @@
     const cleaned = String(markdown || "").replace(/<!--[\s\S]*?-->/g, "");
     const lines = cleaned.replace(/\r\n/g, "\n").split("\n");
     const html = [];
+    let headingSeq = 0;
     let i = 0;
 
     while (i < lines.length) {
@@ -347,7 +366,6 @@
         continue;
       }
 
-      // Fenced code block
       const fenceMatch = trimmed.match(/^(```+|~~~+)(.*)$/);
       if (fenceMatch) {
         const fence = fenceMatch[1];
@@ -362,24 +380,24 @@
         continue;
       }
 
-      // Heading
       const headingMatch = line.match(/^\s{0,3}(#{1,6})\s+(.*)$/);
       if (headingMatch) {
+        headingSeq++;
         const level = headingMatch[1].length;
-        const content = renderInline(headingMatch[2].trim(), currentFilePath);
-        html.push(`<h${level}>${content}</h${level}>`);
+        const rawTitle = headingMatch[2].trim();
+        const content = renderInline(rawTitle, currentFilePath);
+        const hid = `heading-${headingSeq}`;
+        html.push(`<h${level} id="${hid}" data-toc-text="${escapeHtml(rawTitle)}">${content}</h${level}>`);
         i++;
         continue;
       }
 
-      // Horizontal rule
       if (/^(\*{3,}|-{3,}|_{3,})$/.test(trimmed)) {
         html.push("<hr>");
         i++;
         continue;
       }
 
-      // Table
       if (trimmed.startsWith("|") && i + 1 < lines.length && isTableDividerLine(lines[i + 1])) {
         const headers = splitTableCells(lines[i]);
         i += 2;
@@ -405,7 +423,6 @@
         continue;
       }
 
-      // Blockquote
       if (trimmed.startsWith(">")) {
         const quoteLines = [];
         while (i < lines.length && lines[i].trim().startsWith(">")) {
@@ -416,7 +433,6 @@
         continue;
       }
 
-      // Lists
       const ulMatch = line.match(/^\s*[-*+]\s+(.*)$/);
       const olMatch = line.match(/^\s*\d+\.\s+(.*)$/);
       if (ulMatch || olMatch) {
@@ -435,7 +451,6 @@
         continue;
       }
 
-      // Paragraph
       const paraLines = [];
       while (
         i < lines.length &&
@@ -455,6 +470,31 @@
     }
 
     return html.join("\n");
+  }
+
+  function renderToc() {
+    els.tocList.innerHTML = "";
+    const headings = els.markdownView.querySelectorAll("h1, h2, h3, h4, h5, h6");
+    if (headings.length === 0) {
+      const empty = document.createElement("div");
+      empty.className = "toc-item";
+      empty.textContent = t("tocEmpty");
+      els.tocList.appendChild(empty);
+      return;
+    }
+    for (const h of headings) {
+      const level = Number(h.tagName.slice(1));
+      const a = document.createElement("a");
+      a.href = "#" + h.id;
+      a.className = `toc-item toc-level-${level}`;
+      a.textContent = h.getAttribute("data-toc-text") || h.textContent;
+      a.title = a.textContent;
+      a.addEventListener("click", (e) => {
+        e.preventDefault();
+        h.scrollIntoView({ behavior: "smooth", block: "start" });
+      });
+      els.tocList.appendChild(a);
+    }
   }
 
   function updateHistoryButtons() {
@@ -482,6 +522,7 @@
       els.breadcrumb.textContent = data.path;
       els.rawView.textContent = data.content;
       els.markdownView.innerHTML = renderMarkdownToHtml(data.content, data.path);
+      renderToc();
       els.readerScroll.scrollTop = 0;
 
       if (pushHistory) {
@@ -535,7 +576,6 @@
     });
   }
 
-  // Event bindings
   els.langToggle.addEventListener("click", () => {
     state.lang = state.lang === "ko" ? "en" : "ko";
     applyLanguageUI();
