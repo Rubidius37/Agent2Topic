@@ -34,6 +34,8 @@ def inprocess_classifier(vault_dir, lock_held_by_parent=False, extra_args=()):
     ), patch("hierarchical_classifier.resolve_workspace_dir", return_value=vault_dir):
         rc = hierarchical_classifier._main_unlocked(
             [
+                "--vault-dir",
+                vault_dir,
                 "--production",
                 "--output-dir",
                 "Subject",
@@ -64,7 +66,8 @@ class AgentCliTests(unittest.TestCase):
         buf = io.StringIO()
         with redirect_stdout(buf):
             code = agent_cli.main(["--vault-dir", self.vault, *args, "--json"])
-        return code, json.loads(buf.getvalue())
+        raw = buf.getvalue()
+        return code, json.loads(raw), raw
 
     def test_init_creates_workspace_structure_when_empty(self):
         with tempfile.TemporaryDirectory() as empty_dir:
@@ -78,11 +81,11 @@ class AgentCliTests(unittest.TestCase):
             self.assertTrue(os.path.isdir(os.path.join(empty_dir, "attachments")))
 
     def test_rules_and_rule_add_extend_markdown_table(self):
-        code, data = self.run_cli_json("rules")
+        code, data, _ = self.run_cli_json("rules")
         self.assertEqual(code, 0)
         self.assertEqual(data["count"], 6)
 
-        code, added = self.run_cli_json(
+        code, added, _ = self.run_cli_json(
             "rule-add",
             "--path",
             "Projects/Alpha/Deployment",
@@ -94,14 +97,14 @@ class AgentCliTests(unittest.TestCase):
         self.assertTrue(added["changed"])
         self.assertEqual(added["path"], ["Projects", "Alpha", "Deployment"])
 
-        code, updated_rules = self.run_cli_json("rules")
+        code, updated_rules, _ = self.run_cli_json("rules")
         self.assertEqual(code, 0)
         paths = [item["path"] for item in updated_rules["categories"]]
         self.assertIn(["Projects", "Alpha", "Deployment"], paths)
 
     def test_append_sanitizes_agent_headings_and_compiles_context(self):
         with patch.object(agent_cli, "run_production_classifier", side_effect=inprocess_classifier):
-            code, res = self.run_cli_json(
+            code, res, _ = self.run_cli_json(
                 "append",
                 "--path",
                 "Projects/Alpha/Testing",
@@ -115,104 +118,175 @@ class AgentCliTests(unittest.TestCase):
             self.assertEqual(code, 0)
             self.assertEqual(res["log_path"], "Daily_Logs/2026-10-18.md")
 
-            code, ctx = self.run_cli_json("context", "--topic", "Projects/Alpha")
+            code, ctx, _ = self.run_cli_json("context", "--topic", "Projects/Alpha")
             self.assertEqual(code, 0)
             self.assertEqual(ctx["total_entries"], 1)
-            self.assertIn("###### Summary", ctx["entries"][0]["content"])
+            self.assertIn("**Summary**", ctx["entries"][0]["content"])
             self.assertIn("# comment in code", ctx["entries"][0]["content"])
             self.assertTrue(ctx["review_markdown"])
 
             source_id = ctx["entries"][0]["source_id"]
-            code, src = self.run_cli_json("source", "--id", source_id)
+            code, src, _ = self.run_cli_json("source", "--id", source_id)
             self.assertEqual(code, 0)
             self.assertEqual(src["source_id"], source_id)
 
-    def test_search_by_file_kind_query_and_smart_same_topic_merge(self):
+    def test_same_topic_entries_keep_distinct_source_ids_and_metadata_with_preindexed_search(self):
         with patch.object(agent_cli, "run_production_classifier", side_effect=inprocess_classifier):
-            # First append under Projects/Alpha/Testing with explicit --files and --kind
-            code, first = self.run_cli_json(
+            # Entry 1: decision on src/auth.py
+            code, first, _ = self.run_cli_json(
                 "append",
                 "--path",
                 "Projects/Alpha/Testing",
                 "--title",
-                "Atomic write verification",
+                "인증 아키텍처 결정",
+                "--kind",
+                "decision",
+                "--files",
+                "src/auth.py",
+                "--commit",
+                "a1b2c3d",
+                "--date",
+                "2026-10-18",
+                "--content",
+                "Replaced legacy token handling with session cookies.",
+            )
+            self.assertEqual(code, 0)
+            self.assertFalse(first["reused_topic_headings"])
+
+            # Entry 2 on same date & same topic: bugfix on src/login.py
+            code, second, _ = self.run_cli_json(
+                "append",
+                "--path",
+                "Projects/Alpha/Testing",
+                "--title",
+                "로그인 버그 수정",
                 "--kind",
                 "bugfix",
                 "--files",
-                "scripts/review_renderer.py, scripts/atomic_io.py",
+                "src/login.py",
+                "--commit",
+                "e4f5a6b",
                 "--date",
                 "2026-10-18",
                 "--content",
-                "Replaced open() with atomic_write_text.",
+                "Fixed crash on expired session and checked `scripts/workspace_viewer.py`.",
             )
             self.assertEqual(code, 0)
-            self.assertFalse(first["merged_into_last_unit"])
+            self.assertTrue(second["reused_topic_headings"])
 
-            # Second append on same date and same topic -> merges into last unit without repeating H1-H3
-            code, second = self.run_cli_json(
-                "append",
-                "--path",
-                "Projects/Alpha/Testing",
-                "--title",
-                "Follow-up edge case",
-                "--date",
-                "2026-10-18",
-                "--content",
-                "Also checked `scripts/workspace_viewer.py` for path traversal.",
-            )
-            self.assertEqual(code, 0)
-            self.assertTrue(second["merged_into_last_unit"])
-
-            # Third append on same date under sibling topic Projects/Alpha/Planning -> emits only ### Planning
-            code, third = self.run_cli_json(
+            # Entry 3 on same date under sibling topic Projects/Alpha/Planning
+            code, third, _ = self.run_cli_json(
                 "append",
                 "--path",
                 "Projects/Alpha/Planning",
                 "--title",
-                "Roadmap decision",
+                "Roadmap update",
                 "--kind",
-                "decision",
+                "note",
                 "--date",
                 "2026-10-18",
                 "--content",
-                "Adopted read-only local web viewer architecture.",
+                "Adopted bounded context modes.",
             )
             self.assertEqual(code, 0)
-            self.assertFalse(third["merged_into_last_unit"])
+            self.assertFalse(third["reused_topic_headings"])
 
             log_file = os.path.join(self.vault, "Daily_Logs", "2026-10-18.md")
             with open(log_file, "r", encoding="utf-8") as f:
                 raw_log = f.read()
+            # Parent headings are written only once
             self.assertEqual(raw_log.count("# Projects"), 1)
             self.assertEqual(raw_log.count("## Alpha"), 1)
+            self.assertEqual(raw_log.count("### Testing"), 1)
             self.assertIn("### Planning", raw_log)
 
-            # Search by explicit file
-            code, by_file = self.run_cli_json("search", "--file", "review_renderer.py")
+            # Both Testing entries have distinct Source IDs in context
+            code, ctx, _ = self.run_cli_json("context", "--topic", "Projects/Alpha/Testing")
             self.assertEqual(code, 0)
-            self.assertEqual(by_file["total_matches"], 1)
-            self.assertIn("scripts/review_renderer.py", by_file["results"][0]["files"])
+            self.assertEqual(ctx["total_entries"], 2)
+            ids = {e["source_id"] for e in ctx["entries"]}
+            self.assertEqual(len(ids), 2)
 
-            # Search by backticked file in prose
-            code, by_inline_file = self.run_cli_json("search", "--file", "workspace_viewer.py")
-            self.assertEqual(code, 0)
-            self.assertEqual(by_inline_file["total_matches"], 1)
+            # Prove search uses pre-indexed metadata without touching locate_source_unit
+            with patch.object(
+                agent_cli,
+                "locate_source_unit",
+                side_effect=AssertionError("search should use pre-indexed metadata without reading source files"),
+            ):
+                code, by_decision, _ = self.run_cli_json("search", "--kind", "decision")
+                self.assertEqual(code, 0)
+                self.assertEqual(by_decision["total_matches"], 1)
+                self.assertEqual(by_decision["results"][0]["title"], "인증 아키텍처 결정")
 
-            # Search by kind
-            code, by_kind = self.run_cli_json("search", "--kind", "decision")
-            self.assertEqual(code, 0)
-            self.assertEqual(by_kind["total_matches"], 1)
-            self.assertEqual(by_kind["results"][0]["categories"], [["Projects", "Alpha", "Planning"]])
+                code, by_bugfix, _ = self.run_cli_json("search", "--kind", "bugfix")
+                self.assertEqual(code, 0)
+                self.assertEqual(by_bugfix["total_matches"], 1)
+                self.assertEqual(by_bugfix["results"][0]["title"], "로그인 버그 수정")
+                self.assertEqual(by_bugfix["results"][0]["kind"], "bugfix")
 
-            # Search by keyword query
-            code, by_query = self.run_cli_json("search", "--query", "atomic_write_text")
+                code, by_commit, _ = self.run_cli_json("search", "--commit", "e4f5")
+                self.assertEqual(code, 0)
+                self.assertEqual(by_commit["total_matches"], 1)
+                self.assertEqual(by_commit["results"][0]["title"], "로그인 버그 수정")
+
+                code, by_inline_file, _ = self.run_cli_json("search", "--file", "workspace_viewer.py")
+                self.assertEqual(code, 0)
+                self.assertEqual(by_inline_file["total_matches"], 1)
+
+    def test_context_enforces_max_chars_budget_and_modes_on_large_entry(self):
+        with patch.object(agent_cli, "run_production_classifier", side_effect=inprocess_classifier):
+            huge_body = "A" * 96000
+            code, _res, _ = self.run_cli_json(
+                "append",
+                "--path",
+                "Projects/Alpha/Testing",
+                "--title",
+                "96KB stress log",
+                "--kind",
+                "experiment",
+                "--date",
+                "2026-10-18",
+                "--content",
+                huge_body,
+            )
             self.assertEqual(code, 0)
-            self.assertEqual(by_query["total_matches"], 1)
-            self.assertTrue(by_query["related_reviews"])
+
+            code, ctx_review, raw_review_json = self.run_cli_json(
+                "context",
+                "--topic",
+                "Projects/Alpha/Testing",
+                "--mode",
+                "review",
+                "--max-chars",
+                "4000",
+                "--limit",
+                "1",
+            )
+            self.assertEqual(code, 0)
+            self.assertTrue(ctx_review["budget_truncated"])
+            self.assertTrue(ctx_review["entries"][0]["truncated"])
+            self.assertLess(len(raw_review_json), 6500)
+
+            code, ctx_index, raw_index_json = self.run_cli_json(
+                "context",
+                "--topic",
+                "Projects/Alpha/Testing",
+                "--mode",
+                "index",
+            )
+            self.assertEqual(code, 0)
+            self.assertIsNone(ctx_index["review_markdown"])
+            self.assertLess(len(raw_index_json), 2500)
+
+            # Full source is still retrievable via `source --id`
+            sid = ctx_index["entries"][0]["source_id"]
+            code, full_src, _ = self.run_cli_json("source", "--id", sid)
+            self.assertEqual(code, 0)
+            self.assertGreaterEqual(len(full_src["content"]), 96000)
 
     def test_append_with_create_rule_and_manual_classify(self):
         with patch.object(agent_cli, "run_production_classifier", side_effect=inprocess_classifier):
-            code, res = self.run_cli_json(
+            code, res, _ = self.run_cli_json(
                 "append",
                 "--path",
                 "Projects/Beta/Benchmarks",
@@ -229,15 +303,15 @@ class AgentCliTests(unittest.TestCase):
             with open(unclassified_log, "w", encoding="utf-8") as file_obj:
                 file_obj.write("# Unknown Heading\nMystery note needing manual triage.\n")
 
-            code, upd = self.run_cli_json("update")
+            code, upd, _ = self.run_cli_json("update")
             self.assertEqual(code, 0)
 
-            code, status = self.run_cli_json("status")
+            code, status, _ = self.run_cli_json("status")
             self.assertEqual(code, 0)
             self.assertEqual(status["needs_review_count"], 1)
             target_id = status["needs_review"][0]["source_id"]
 
-            code, classified = self.run_cli_json(
+            code, classified, _ = self.run_cli_json(
                 "classify",
                 "--source-id",
                 target_id,
@@ -247,12 +321,12 @@ class AgentCliTests(unittest.TestCase):
             self.assertEqual(code, 0)
             self.assertTrue(classified["changed"])
 
-            code, status_after = self.run_cli_json("status")
+            code, status_after, _ = self.run_cli_json("status")
             self.assertEqual(code, 0)
             self.assertEqual(status_after["needs_review_count"], 0)
 
     def test_real_subprocess_classifier_on_external_vault_and_rebuild_ids(self):
-        code, res = self.run_cli_json(
+        code, res, _ = self.run_cli_json(
             "append",
             "--path",
             "Projects/Alpha/Testing",
@@ -268,7 +342,7 @@ class AgentCliTests(unittest.TestCase):
             os.path.isfile(os.path.join(self.vault, "scripts", "organizer_metadata.json"))
         )
 
-        code, rebuilt = self.run_cli_json("update", "--rebuild-ids")
+        code, rebuilt, _ = self.run_cli_json("update", "--rebuild-ids")
         self.assertEqual(code, 0)
         self.assertTrue(rebuilt["rebuild_ids"])
 

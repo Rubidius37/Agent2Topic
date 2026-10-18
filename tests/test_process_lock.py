@@ -122,6 +122,24 @@ class ProcessLockTests(unittest.TestCase):
 
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
+    def test_grandchild_via_stub_can_use_lock_delegated_by_ancestor(self):
+        stub_code = (
+            "import subprocess, sys\n"
+            "rc = subprocess.call([sys.executable, '-c', sys.argv[1], sys.argv[2]])\n"
+            "raise SystemExit(rc)\n"
+        )
+        with tempfile.TemporaryDirectory() as vault_dir:
+            with VaultProcessLock(vault_dir, "venv-stub-delegation"):
+                result = subprocess.run(
+                    [sys.executable, "-c", stub_code, DELEGATION_CHILD, SCRIPTS_DIR],
+                    env=delegated_lock_environment(),
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                )
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
 
 if __name__ == "__main__":
     unittest.main()

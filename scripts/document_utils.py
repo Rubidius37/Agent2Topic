@@ -246,3 +246,79 @@ def cleanup_generated_root(vault_dir, root_name, desired_paths, marker):
         except OSError:
             pass
     return deleted
+
+
+KIND_META_RE = re.compile(r"^\*\*Kind\*\*\s*:\s*(.+?)\s*$", re.IGNORECASE)
+FILES_META_RE = re.compile(r"^\*\*Files\*\*\s*:\s*(.+?)\s*$", re.IGNORECASE)
+COMMIT_META_RE = re.compile(r"^\*\*Commit\*\*\s*:\s*(.+?)\s*$", re.IGNORECASE)
+INLINE_FILE_PATH_RE = re.compile(r"`([A-Za-z0-9_./\\-]+\.[A-Za-z0-9]{1,10})`")
+
+
+def extract_entry_metadata(content):
+    """Extract Kind, Files, Commit, Summary, and Search Text from a SourceUnit body."""
+    kind = None
+    commit = None
+    files = []
+    seen_files = set()
+    body_lines = []
+
+    def add_file(candidate):
+        norm = normalize_rel_path(str(candidate or "").strip().strip("`\"'")).lstrip("./")
+        if norm and not norm.startswith(("http://", "https://")) and norm.casefold() not in seen_files:
+            seen_files.add(norm.casefold())
+            files.append(norm)
+
+    fence = None
+    for raw_line in str(content or "").splitlines():
+        fence_match = re.match(r"^[ \t]{0,3}(`{3,}|~{3,})([^\r\n]*)", raw_line)
+        if fence_match:
+            marker, suffix = fence_match.groups()
+            if fence is None and (marker[0] != "`" or "`" not in suffix):
+                fence = marker
+                body_lines.append(raw_line)
+                continue
+            if fence is not None and marker[0] == fence[0] and len(marker) >= len(fence) and not suffix.strip():
+                fence = None
+                body_lines.append(raw_line)
+                continue
+        if fence is not None:
+            body_lines.append(raw_line)
+            continue
+
+        stripped = raw_line.strip()
+        if not stripped:
+            continue
+        if re.match(r"^#{1,6}[ \t]+", stripped) or re.match(r"^<!--.*-->$", stripped):
+            continue
+        if re.match(r"^(?:Category|분류)\s*:", stripped, re.IGNORECASE):
+            continue
+        m_kind = KIND_META_RE.match(stripped)
+        if m_kind:
+            if kind is None:
+                kind = m_kind.group(1).strip().strip("`").lower()
+            continue
+        m_files = FILES_META_RE.match(stripped)
+        if m_files:
+            for item in m_files.group(1).split(","):
+                add_file(item)
+            continue
+        m_commit = COMMIT_META_RE.match(stripped)
+        if m_commit:
+            if commit is None:
+                commit = m_commit.group(1).strip().strip("`")
+            continue
+
+        for match in INLINE_FILE_PATH_RE.finditer(raw_line):
+            add_file(match.group(1))
+        body_lines.append(stripped)
+
+    clean_text = "\n".join(body_lines).strip()
+    single_line = re.sub(r"\s+", " ", clean_text).strip()
+    summary = single_line[:240] + ("…" if len(single_line) > 240 else "")
+    return {
+        "kind": kind,
+        "files": files,
+        "commit": commit,
+        "summary": summary,
+        "search_text": clean_text[:4000],
+    }

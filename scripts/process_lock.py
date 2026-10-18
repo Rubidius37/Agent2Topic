@@ -43,9 +43,94 @@ def command_text(script_path, argv=None):
     return " ".join(values)[:2000]
 
 
+def _windows_parent_pid_map():
+    import ctypes
+    from ctypes import wintypes
+
+    TH32CS_SNAPPROCESS = 0x00000002
+    INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
+
+    class PROCESSENTRY32W(ctypes.Structure):
+        _fields_ = [
+            ("dwSize", wintypes.DWORD),
+            ("cntUsage", wintypes.DWORD),
+            ("th32ProcessID", wintypes.DWORD),
+            ("th32DefaultHeapID", ctypes.c_size_t),
+            ("th32ModuleID", wintypes.DWORD),
+            ("cntThreads", wintypes.DWORD),
+            ("th32ParentProcessID", wintypes.DWORD),
+            ("pcPriClassBase", wintypes.LONG),
+            ("dwFlags", wintypes.DWORD),
+            ("szExeFile", wintypes.WCHAR * 260),
+        ]
+
+    kernel32 = ctypes.windll.kernel32
+    snapshot = kernel32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
+    if snapshot == INVALID_HANDLE_VALUE:
+        return {}
+    parent_map = {}
+    try:
+        entry = PROCESSENTRY32W()
+        entry.dwSize = ctypes.sizeof(PROCESSENTRY32W)
+        if kernel32.Process32FirstW(snapshot, ctypes.byref(entry)):
+            while True:
+                parent_map[int(entry.th32ProcessID)] = int(entry.th32ParentProcessID)
+                if not kernel32.Process32NextW(snapshot, ctypes.byref(entry)):
+                    break
+    finally:
+        kernel32.CloseHandle(snapshot)
+    return parent_map
+
+
+def _posix_parent_pid(pid):
+    try:
+        with open(f"/proc/{pid}/stat", "r", encoding="utf-8") as file_obj:
+            stat = file_obj.read()
+        rparen = stat.rfind(")")
+        if rparen != -1:
+            fields = stat[rparen + 2 :].split()
+            if len(fields) >= 2 and fields[1].isdigit():
+                return int(fields[1])
+    except OSError:
+        pass
+    return None
+
+
+def _ancestor_pids(max_depth=6):
+    ancestors = {os.getppid()}
+    if os.name == "nt":
+        try:
+            parent_map = _windows_parent_pid_map()
+            current = os.getpid()
+            for _ in range(max_depth):
+                parent = parent_map.get(current)
+                if not parent or parent == current or (parent in ancestors and len(ancestors) > 1):
+                    if parent:
+                        ancestors.add(parent)
+                    break
+                ancestors.add(parent)
+                current = parent
+        except Exception:
+            pass
+    else:
+        current = os.getppid()
+        for _ in range(max_depth):
+            parent = _posix_parent_pid(current)
+            if not parent or parent <= 1 or parent in ancestors:
+                break
+            ancestors.add(parent)
+            current = parent
+    return ancestors
+
+
 def lock_is_delegated_by_parent():
     expected_parent = os.environ.get(LOCK_PARENT_PID_ENV, "").strip()
-    return expected_parent.isdigit() and int(expected_parent) == os.getppid()
+    if not expected_parent.isdigit():
+        return False
+    target_pid = int(expected_parent)
+    if target_pid == os.getppid():
+        return True
+    return target_pid in _ancestor_pids()
 
 
 def delegated_lock_environment(base_env=None):

@@ -14,6 +14,7 @@ import urllib.parse
 
 from atomic_io import atomic_write_json, atomic_write_text as _atomic_write_text, filesystem_path
 from hierarchical_classifier import (
+    ANY_UNIT_HEADING_RE,
     CATEGORY_LEVELS,
     HEADING_RE,
     METADATA_SCHEMA_VERSION,
@@ -444,7 +445,7 @@ def apply_manual_categories(
         insert_index = start_index
         if frontmatter_end is not None:
             insert_index = 1
-        elif 0 <= start_index < len(lines) and HEADING_RE.match(lines[start_index]):
+        elif 0 <= start_index < len(lines) and ANY_UNIT_HEADING_RE.match(lines[start_index]):
             insert_index += 1
         while insert_index < end_index and SOURCE_ID_RE.fullmatch(lines[insert_index].strip()):
             insert_index += 1

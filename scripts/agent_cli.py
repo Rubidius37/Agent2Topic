@@ -5,11 +5,13 @@ from datetime import date
 import json
 import os
 import re
+import subprocess
 import sys
 
 from atomic_io import StateFileError, atomic_write_text, filesystem_path
-from document_utils import normalize_rel_path, source_date_key
+from document_utils import extract_entry_metadata, normalize_rel_path, source_date_key
 from hierarchical_classifier import (
+    ANY_UNIT_HEADING_RE,
     CATEGORY_LEVELS,
     HEADING_RE,
     SOURCE_ID_RE,
@@ -50,11 +52,10 @@ from workspace_paths import (
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_VAULT_DIR = resolve_workspace_dir(SCRIPT_DIR)
 
-KIND_LINE_RE = re.compile(r"^\*\*Kind\*\*\s*:\s*(.+?)\s*$", re.IGNORECASE)
-FILES_LINE_RE = re.compile(r"^\*\*Files\*\*\s*:\s*(.+?)\s*$", re.IGNORECASE)
-INLINE_FILE_RE = re.compile(
-    r"`([A-Za-z0-9_./\\-]+\.[A-Za-z0-9]{1,10})`"
-)
+DEFAULT_CONTEXT_MAX_CHARS = 12000
+DEFAULT_REVIEW_ENTRY_CHARS = 1200
+DEFAULT_ENTRIES_MODE_CHARS = 4000
+DEFAULT_SEARCH_ENTRY_CHARS = 600
 
 DEFAULT_RULES_TEMPLATE = """\
 # Classification Rules
@@ -90,7 +91,7 @@ def split_category_path(raw_path):
 
 
 def sanitize_agent_body_headings(content):
-    """Demote H1-H5 headings in agent body text to H6 so they never split classification units."""
+    """Convert H1-H6 headings inside agent body text to bold lines so they never split Topic (H1-H5) or Entry (H6) units."""
     out = []
     for line, in_code in source_lines_with_code_context(content, keepends=True):
         if in_code or is_markdown_blockquote_line(line):
@@ -98,10 +99,10 @@ def sanitize_agent_body_headings(content):
             continue
         stripped = line.rstrip("\r\n")
         ending = line[len(stripped):]
-        match = HEADING_RE.match(stripped)
+        match = ANY_UNIT_HEADING_RE.match(stripped)
         if match:
             title = match.group(2).strip()
-            out.append((f"###### {title}" if title else stripped) + ending)
+            out.append((f"**{title}**" if title else stripped) + ending)
         else:
             out.append(line)
     return "".join(out)
@@ -126,36 +127,36 @@ def parse_file_list(raw_files):
     return result
 
 
-def extract_entry_metadata(content):
-    """Extract Kind and Files metadata (explicit or backticked file paths) from unit content."""
-    kind = None
-    files = []
-    seen_files = set()
+def detect_git_head_commit(cwd=None):
+    try:
+        res = subprocess.run(
+            ["git", "rev-parse", "--short=12", "HEAD"],
+            cwd=cwd or os.getcwd(),
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            timeout=5,
+        )
+        if res.returncode == 0:
+            sha = res.stdout.strip()
+            if re.fullmatch(r"[0-9a-fA-F]{7,40}", sha):
+                return sha.lower()
+    except Exception:
+        pass
+    return None
 
-    def add_file(candidate):
-        norm = normalize_rel_path(candidate.strip().strip("`\"'")).lstrip("./")
-        if norm and not norm.startswith(("http://", "https://")) and norm.casefold() not in seen_files:
-            seen_files.add(norm.casefold())
-            files.append(norm)
 
-    for line, in_code in source_lines_with_code_context(str(content or "")):
-        if in_code:
-            continue
-        stripped = line.strip()
-        if kind is None:
-            m_kind = KIND_LINE_RE.match(stripped)
-            if m_kind:
-                kind = m_kind.group(1).strip().strip("`").lower()
-                continue
-        m_files = FILES_LINE_RE.match(stripped)
-        if m_files:
-            for item in m_files.group(1).split(","):
-                add_file(item)
-            continue
-        for match in INLINE_FILE_RE.finditer(line):
-            add_file(match.group(1))
-
-    return {"kind": kind, "files": files}
+def _truncate_text(text, limit, source_id=None):
+    raw = str(text or "")
+    if limit is None or limit <= 0 or len(raw) <= limit:
+        return raw, False
+    suffix = (
+        f"\n...(truncated; run 'pagent source --id {source_id}' for full text)"
+        if source_id
+        else "\n...(truncated)"
+    )
+    keep = max(0, limit - len(suffix))
+    return raw[:keep].rstrip() + suffix, True
 
 
 def ensure_workspace_initialized(vault_dir):
@@ -298,7 +299,7 @@ def add_rule_to_markdown(rules_filepath, raw_path, raw_keywords=""):
 
 
 def _determine_headings_to_emit(existing_filepath, tree, resolved, merge_same_topic):
-    """Determine which H1-H5 headings need to be written when appending to an existing log."""
+    """Determine which H1-H5 topic headings need to be written when appending a new Entry."""
     full_headings = [f"{'#' * (idx + 1)} {part}" for idx, part in enumerate(resolved)]
     if not merge_same_topic or not os.path.isfile(filesystem_path(existing_filepath)):
         return full_headings, False
@@ -312,12 +313,12 @@ def _determine_headings_to_emit(existing_filepath, tree, resolved, merge_same_to
         return full_headings, False
 
     last_unit = units[-1]
-    structural_headings_in_last = sum(
+    extra_h1_h5_in_last = sum(
         1
-        for line, in_code in source_lines_with_code_context(last_unit.content)
-        if not in_code and HEADING_RE.match(line)
+        for idx, (line, in_code) in enumerate(source_lines_with_code_context(last_unit.content))
+        if idx > 0 and not in_code and HEADING_RE.match(line)
     )
-    if structural_headings_in_last != 1:
+    if extra_h1_h5_in_last > 0:
         return full_headings, False
 
     last_cat = tuple(last_unit.category_path)
@@ -327,13 +328,13 @@ def _determine_headings_to_emit(existing_filepath, tree, resolved, merge_same_to
     ):
         return full_headings, False
 
-    # Exact same category path at the tail of today's log -> merge directly into last unit
+    # Same active topic at EOF -> reuse parent H1-H5 headings without repeating them
     if len(last_cat) == len(resolved) and all(
         normalize_name(a) == normalize_name(b) for a, b in zip(last_cat, resolved)
     ):
         return [], True
 
-    # Shared prefix -> emit only diverging headings from common prefix onwards
+    # Shared prefix -> emit only diverging H2-H5 headings
     common_len = 0
     for a, b in zip(last_cat, resolved):
         if normalize_name(a) == normalize_name(b):
@@ -358,6 +359,7 @@ def append_log_entry(
     escape_headings=True,
     files=None,
     kind=None,
+    commit=None,
     merge_same_topic=True,
 ):
     parts = split_category_path(raw_category_path)
@@ -405,6 +407,7 @@ def append_log_entry(
 
     normalized_files = parse_file_list(files)
     normalized_kind = str(kind or "").strip().lower() or None
+    normalized_commit = str(commit or "").strip() or None
 
     meta_lines = []
     if normalized_kind:
@@ -412,26 +415,19 @@ def append_log_entry(
     if normalized_files:
         formatted_files = ", ".join(f"`{f}`" for f in normalized_files)
         meta_lines.append(f"**Files**: {formatted_files}")
+    if normalized_commit:
+        meta_lines.append(f"**Commit**: `{normalized_commit}`")
     if meta_lines:
         body = "\n".join(meta_lines) + "\n\n" + body
 
-    heading_lines, merged_into_last = _determine_headings_to_emit(
+    heading_lines, reused_topic_headings = _determine_headings_to_emit(
         target_path, tree, resolved, merge_same_topic=merge_same_topic
     )
 
-    if title and normalize_name(title) != normalize_name(resolved[-1]):
-        clean_title = str(title).strip()
-        if clean_title:
-            heading_lines.append(f"###### {clean_title}")
-    elif merged_into_last and title:
-        clean_title = str(title).strip()
-        if clean_title:
-            heading_lines.append(f"###### {clean_title}")
+    entry_title = str(title).strip() if title and str(title).strip() else resolved[-1]
+    heading_lines.append(f"###### {entry_title}")
 
-    if heading_lines:
-        section_text = "\n".join(heading_lines) + "\n\n" + body + "\n"
-    else:
-        section_text = body + "\n"
+    section_text = "\n".join(heading_lines) + "\n\n" + body + "\n"
 
     existing = ""
     if os.path.isfile(filesystem_path(target_path)):
@@ -454,10 +450,12 @@ def append_log_entry(
     return {
         "log_path": rel_log_path,
         "category_path": list(resolved),
-        "title": title or resolved[-1],
+        "title": entry_title,
         "kind": normalized_kind,
         "files": normalized_files,
-        "merged_into_last_unit": merged_into_last,
+        "commit": normalized_commit,
+        "reused_topic_headings": reused_topic_headings,
+        "merged_into_last_unit": reused_topic_headings,
     }
 
 
@@ -473,22 +471,60 @@ def _find_review_path_for_category(vault_dir, category_tuple):
     return None
 
 
+def _get_entry_meta_and_text(vault_dir, tree, source_id, entry, need_full_content=False):
+    """Retrieve pre-indexed metadata from entry, reading source file only if needed."""
+    has_indexed = "summary" in entry and "search_text" in entry
+    raw_content = None
+    if not has_indexed or need_full_content:
+        try:
+            _fp, _rel, _units, _idx, unit = locate_source_unit(
+                vault_dir, tree, source_id, entry
+            )
+            raw_content = SOURCE_ID_RE.sub("", unit.content).strip()
+        except Exception:
+            raw_content = ""
+
+    if has_indexed:
+        meta = {
+            "kind": entry.get("kind"),
+            "files": list(entry.get("files") or []),
+            "commit": entry.get("commit"),
+            "summary": entry.get("summary", ""),
+            "search_text": entry.get("search_text", ""),
+        }
+    else:
+        meta = extract_entry_metadata(raw_content or "")
+
+    return meta, raw_content
+
+
 def query_topic_context(
     vault_dir,
     metadata_path,
     rules_path,
     raw_topic_path,
     limit=5,
+    mode="review",
+    max_chars=DEFAULT_CONTEXT_MAX_CHARS,
+    max_entry_chars=None,
 ):
     parts = split_category_path(raw_topic_path)
     tree = parse_rules_from_markdown(rules_path)
     resolved = tree.resolve_manual_path(parts) or tuple(parts)
     norm_prefix = tuple(normalize_name(p) for p in resolved)
 
+    if max_entry_chars is None:
+        if mode == "index":
+            max_entry_chars = 240
+        elif mode == "entries":
+            max_entry_chars = DEFAULT_ENTRIES_MODE_CHARS
+        else:
+            max_entry_chars = DEFAULT_REVIEW_ENTRY_CHARS
+
     metadata = load_metadata(metadata_path) if os.path.isfile(metadata_path) else {}
     entries = metadata.get("entries", {}) if isinstance(metadata, dict) else {}
 
-    matched_entries = []
+    candidates = []
     for source_id, entry in entries.items():
         if not isinstance(entry, dict):
             continue
@@ -505,48 +541,82 @@ def query_topic_context(
         if not hit:
             continue
         source_rel = entry.get("source_path", "")
-        excerpt = ""
-        try:
-            _fp, _rel, _units, _idx, unit = locate_source_unit(
-                vault_dir, tree, source_id, entry
-            )
-            excerpt = unit.content
-        except Exception:
-            excerpt = ""
-        meta = extract_entry_metadata(excerpt)
-        matched_entries.append(
-            {
-                "source_id": source_id,
-                "date": source_date_key(source_rel),
-                "source_path": source_rel,
-                "source_line": entry.get("source_line", 0),
-                "title": entry.get("source_heading", ""),
-                "kind": meta["kind"],
-                "files": meta["files"],
-                "categories": [list(cat) for cat in matched_cats],
-                "generated_paths": entry.get("generated_paths", []),
-                "content": excerpt,
-            }
-        )
+        entry_date = entry.get("date") or source_date_key(source_rel)
+        candidates.append((entry_date, source_rel, entry.get("source_line", 0), source_id, entry, matched_cats))
 
-    matched_entries.sort(
-        key=lambda item: (item["date"], item["source_path"], item["source_line"]),
-        reverse=True,
-    )
+    candidates.sort(key=lambda item: (item[0], item[1], item[2]), reverse=True)
+    total_entries = len(candidates)
+    selected_candidates = candidates[: max(0, int(limit))]
 
     review_rel_path = _find_review_path_for_category(vault_dir, resolved)
     review_content = None
-    if review_rel_path:
+    review_truncated = False
+    remaining_budget = max(500, int(max_chars)) if max_chars and max_chars > 0 else None
+
+    if mode != "index" and review_rel_path:
         full_rev = os.path.join(vault_dir, *review_rel_path.split("/"))
-        with open(filesystem_path(full_rev), "r", encoding="utf-8") as file_obj:
-            review_content = file_obj.read()
+        if os.path.isfile(filesystem_path(full_rev)):
+            with open(filesystem_path(full_rev), "r", encoding="utf-8") as file_obj:
+                raw_rev = file_obj.read()
+            if remaining_budget is not None:
+                rev_cap = remaining_budget if mode == "review" else max(1000, remaining_budget // 2)
+                review_content, review_truncated = _truncate_text(raw_rev, rev_cap)
+                remaining_budget = max(0, remaining_budget - len(review_content))
+            else:
+                review_content = raw_rev
+
+    matched_entries = []
+    budget_truncated = review_truncated
+    need_body = mode in {"review", "entries"}
+
+    for entry_date, source_rel, source_line, source_id, entry, matched_cats in selected_candidates:
+        meta, raw_content = _get_entry_meta_and_text(
+            vault_dir, tree, source_id, entry, need_full_content=need_body
+        )
+        item = {
+            "source_id": source_id,
+            "date": entry_date,
+            "source_path": source_rel,
+            "source_line": source_line,
+            "title": entry.get("source_heading", ""),
+            "kind": meta["kind"],
+            "files": meta["files"],
+            "commit": meta["commit"],
+            "summary": meta["summary"],
+            "categories": [list(cat) for cat in matched_cats],
+            "generated_paths": entry.get("generated_paths", []),
+        }
+        if mode == "index":
+            item["content"] = meta["summary"]
+            item["truncated"] = False
+        else:
+            effective_cap = max_entry_chars
+            if remaining_budget is not None:
+                if remaining_budget <= 120:
+                    item["content"] = meta["summary"]
+                    item["truncated"] = True
+                    budget_truncated = True
+                    matched_entries.append(item)
+                    continue
+                effective_cap = min(effective_cap, remaining_budget) if effective_cap else remaining_budget
+            bounded_text, was_trunc = _truncate_text(raw_content or meta["summary"], effective_cap, source_id=source_id)
+            item["content"] = bounded_text
+            item["truncated"] = was_trunc
+            if was_trunc:
+                budget_truncated = True
+            if remaining_budget is not None:
+                remaining_budget = max(0, remaining_budget - len(bounded_text))
+        matched_entries.append(item)
 
     return {
         "topic_path": list(resolved),
+        "mode": mode,
+        "max_chars": max_chars,
+        "budget_truncated": budget_truncated,
         "review_path": review_rel_path,
         "review_markdown": review_content,
-        "total_entries": len(matched_entries),
-        "entries": matched_entries[: max(0, int(limit))],
+        "total_entries": total_entries,
+        "entries": matched_entries,
     }
 
 
@@ -557,8 +627,11 @@ def search_workspace_entries(
     query=None,
     file_filter=None,
     kind_filter=None,
+    commit_filter=None,
     topic_filter=None,
     limit=10,
+    max_chars=DEFAULT_CONTEXT_MAX_CHARS,
+    max_entry_chars=DEFAULT_SEARCH_ENTRY_CHARS,
 ):
     tree = parse_rules_from_markdown(rules_path)
     norm_topic_prefix = None
@@ -574,11 +647,12 @@ def search_workspace_entries(
         else None
     )
     norm_kind_filter = str(kind_filter or "").strip().casefold() if kind_filter else None
+    norm_commit_filter = str(commit_filter or "").strip().casefold() if commit_filter else None
 
     metadata = load_metadata(metadata_path) if os.path.isfile(metadata_path) else {}
     entries = metadata.get("entries", {}) if isinstance(metadata, dict) else {}
 
-    results = []
+    matched_raw = []
     related_reviews = []
     seen_reviews = set()
 
@@ -599,25 +673,21 @@ def search_workspace_entries(
             if not hit_topic:
                 continue
 
-        source_rel = entry.get("source_path", "")
-        content = ""
-        try:
-            _fp, _rel, _units, _idx, unit = locate_source_unit(
-                vault_dir, tree, source_id, entry
-            )
-            content = unit.content
-        except Exception:
-            content = ""
-
-        clean_content = SOURCE_ID_RE.sub("", content).strip()
-        meta = extract_entry_metadata(clean_content)
+        meta, _unused = _get_entry_meta_and_text(
+            vault_dir, tree, source_id, entry, need_full_content=False
+        )
 
         if norm_kind_filter and (meta["kind"] or "").casefold() != norm_kind_filter:
             continue
 
+        if norm_commit_filter:
+            entry_commit = (meta["commit"] or "").casefold()
+            if not entry_commit or not entry_commit.startswith(norm_commit_filter):
+                continue
+
         if norm_file_filter:
             file_hit = any(norm_file_filter in f.casefold() for f in meta["files"]) or (
-                norm_file_filter in normalize_rel_path(clean_content).casefold()
+                norm_file_filter in normalize_rel_path(meta["search_text"]).casefold()
             )
             if not file_hit:
                 continue
@@ -629,7 +699,8 @@ def search_workspace_entries(
                     " ".join("/".join(cat) for cat in matched_cats),
                     " ".join(meta["files"]),
                     meta["kind"] or "",
-                    clean_content,
+                    meta["commit"] or "",
+                    meta["search_text"],
                 ]
             ).casefold()
             if not all(term in haystack for term in query_terms):
@@ -641,34 +712,56 @@ def search_workspace_entries(
                 seen_reviews.add(rev)
                 related_reviews.append(rev)
 
+        source_rel = entry.get("source_path", "")
+        entry_date = entry.get("date") or source_date_key(source_rel)
+        matched_raw.append(
+            (entry_date, source_rel, entry.get("source_line", 0), source_id, entry, matched_cats, meta)
+        )
+
+    matched_raw.sort(key=lambda item: (item[0], item[1], item[2]), reverse=True)
+    total_matches = len(matched_raw)
+
+    results = []
+    remaining_budget = max(500, int(max_chars)) if max_chars and max_chars > 0 else None
+    budget_truncated = False
+
+    for entry_date, source_rel, source_line, source_id, entry, matched_cats, meta in matched_raw[: max(0, int(limit))]:
+        effective_cap = max_entry_chars
+        if remaining_budget is not None:
+            effective_cap = min(effective_cap, remaining_budget) if effective_cap else remaining_budget
+        preview, was_trunc = _truncate_text(meta["search_text"] or meta["summary"], effective_cap, source_id=source_id)
+        if was_trunc:
+            budget_truncated = True
+        if remaining_budget is not None:
+            remaining_budget = max(0, remaining_budget - len(preview))
         results.append(
             {
                 "source_id": source_id,
-                "date": source_date_key(source_rel),
+                "date": entry_date,
                 "source_path": source_rel,
-                "source_line": entry.get("source_line", 0),
+                "source_line": source_line,
                 "title": entry.get("source_heading", ""),
                 "kind": meta["kind"],
                 "files": meta["files"],
+                "commit": meta["commit"],
+                "summary": meta["summary"],
                 "categories": [list(cat) for cat in matched_cats],
                 "generated_paths": entry.get("generated_paths", []),
-                "content": clean_content,
+                "content": preview,
+                "truncated": was_trunc,
             }
         )
-
-    results.sort(
-        key=lambda item: (item["date"], item["source_path"], item["source_line"]),
-        reverse=True,
-    )
 
     return {
         "query": query or "",
         "file": file_filter or "",
         "kind": kind_filter or "",
+        "commit": commit_filter or "",
         "topic": topic_filter or "",
-        "total_matches": len(results),
+        "total_matches": total_matches,
+        "budget_truncated": budget_truncated,
         "related_reviews": sorted(related_reviews),
-        "results": results[: max(0, int(limit))],
+        "results": results,
     }
 
 
@@ -698,32 +791,45 @@ def build_parser():
     p_rule_add.add_argument("--no-update", action="store_true", help="Do not run local classifier after updating rules.")
     p_rule_add.add_argument("--json", action="store_true")
 
-    p_append = sub.add_parser("append", help="Append a structured entry to Daily_Logs and compile.")
+    p_append = sub.add_parser("append", help="Append a structured work event Entry to Daily_Logs and compile.")
     p_append.add_argument("--path", required=True, help="Category path (e.g. 'Projects/Alpha/Testing').")
-    p_append.add_argument("--title", default=None, help="Optional subsection title.")
+    p_append.add_argument("--title", default=None, help="Entry title (written as H6 '###### <title>').")
     p_append.add_argument("--content", default=None, help="Markdown body content.")
     p_append.add_argument("--stdin", action="store_true", help="Read Markdown body content from stdin.")
     p_append.add_argument("--files", action="append", default=[], help="Related code/file paths (comma-separated or repeated).")
     p_append.add_argument("--kind", default=None, help="Entry type (e.g. decision, bugfix, experiment, refactor, note).")
+    p_append.add_argument("--commit", default=None, help="Git commit SHA associated with this entry.")
+    p_append.add_argument("--git", action="store_true", help="Automatically record current Git HEAD short SHA.")
     p_append.add_argument("--date", default=None, help="Log date (YYYY-MM-DD). Defaults to today.")
     p_append.add_argument("--log-file", default=None, help="Specific filename under Daily_Logs/.")
     p_append.add_argument("--create-rule", action="store_true", help="Automatically add the path to Classification_Rules.md if missing.")
-    p_append.add_argument("--no-merge", action="store_true", help="Always write full H1-H5 headings instead of merging with the tail section.")
-    p_append.add_argument("--no-escape-headings", action="store_true", help="Do not demote H1-H5 headings inside body content.")
+    p_append.add_argument("--no-merge", action="store_true", help="Always write full H1-H5 topic headings before the entry.")
+    p_append.add_argument("--no-escape-headings", action="store_true", help="Do not convert headings inside body content.")
     p_append.add_argument("--no-update", action="store_true", help="Write log entry without running the classifier.")
     p_append.add_argument("--json", action="store_true")
 
-    p_context = sub.add_parser("context", help="Retrieve compiled review and recent entries for a topic.")
+    p_context = sub.add_parser("context", help="Retrieve bounded compiled review and recent entries for a topic.")
     p_context.add_argument("--topic", required=True, help="Topic path prefix (e.g. 'Projects/Alpha').")
+    p_context.add_argument(
+        "--mode",
+        choices=["review", "index", "entries"],
+        default="review",
+        help="Context detail mode: 'index' (metadata only), 'review' (bounded review + summaries), 'entries' (bounded entries).",
+    )
     p_context.add_argument("--limit", type=int, default=5, help="Max individual entries to return.")
+    p_context.add_argument("--max-chars", type=int, default=DEFAULT_CONTEXT_MAX_CHARS, help="Max total characters to return (default: 12000).")
+    p_context.add_argument("--max-entry-chars", type=int, default=None, help="Max characters per individual entry.")
     p_context.add_argument("--json", action="store_true")
 
-    p_search = sub.add_parser("search", help="Search entries by keyword query, modified file path, kind, or topic.")
+    p_search = sub.add_parser("search", help="Search pre-indexed entries by keyword query, modified file path, kind, commit, or topic.")
     p_search.add_argument("--query", "-q", default=None, help="Keyword query across headings, categories, and body.")
     p_search.add_argument("--file", "-f", default=None, help="Filter by referenced/modified file path (e.g. 'review_renderer.py').")
     p_search.add_argument("--kind", "-k", default=None, help="Filter by entry kind (e.g. 'decision', 'bugfix').")
+    p_search.add_argument("--commit", "-c", default=None, help="Filter by Git commit SHA prefix.")
     p_search.add_argument("--topic", "-t", default=None, help="Optional topic prefix filter.")
     p_search.add_argument("--limit", type=int, default=10, help="Max matching entries to return (default: 10).")
+    p_search.add_argument("--max-chars", type=int, default=DEFAULT_CONTEXT_MAX_CHARS, help="Max total characters to return (default: 12000).")
+    p_search.add_argument("--max-entry-chars", type=int, default=DEFAULT_SEARCH_ENTRY_CHARS, help="Max preview characters per entry (default: 600).")
     p_search.add_argument("--json", action="store_true")
 
     p_status = sub.add_parser("status", help="Show classification statistics and items needing review.")
@@ -737,12 +843,14 @@ def build_parser():
 
     p_source = sub.add_parser("source", help="Inspect a specific Source ID entry.")
     p_source.add_argument("--id", required=True, help="Target Source ID.")
+    p_source.add_argument("--max-chars", type=int, default=None, help="Optional character cap on returned content.")
     p_source.add_argument("--json", action="store_true")
 
     p_view = sub.add_parser("view", help="Open the read-only local web viewer (folder tree + Markdown renderer).")
     p_view.add_argument("--port", type=int, default=8000, help="Local port (default: 8000).")
     p_view.add_argument("--no-browser", action="store_true", help="Do not open browser automatically.")
-    p_view.add_argument("--no-refresh", action="store_true", help="Skip running classifier before starting viewer.")
+    p_view.add_argument("--refresh", action="store_true", help="Run classifier update before opening viewer.")
+    p_view.add_argument("--no-refresh", action="store_true", help=argparse.SUPPRESS)
 
     return parser
 
@@ -857,6 +965,7 @@ def main(argv=None):
         if args.subcommand == "append":
             ensure_workspace_initialized(vault_dir)
             body = sys.stdin.read() if args.stdin else args.content
+            effective_commit = args.commit or (detect_git_head_commit() if args.git else None)
             with VaultProcessLock(vault_dir, "agent-append", command=command_text(__file__, argv)):
                 res = append_log_entry(
                     vault_dir,
@@ -870,6 +979,7 @@ def main(argv=None):
                     escape_headings=not args.no_escape_headings,
                     files=args.files,
                     kind=args.kind,
+                    commit=effective_commit,
                     merge_same_topic=not args.no_merge,
                 )
                 rebuild = {"ok": True}
@@ -894,15 +1004,28 @@ def main(argv=None):
 
         if args.subcommand == "context":
             ctx = query_topic_context(
-                vault_dir, metadata_path, rules_path, args.topic, limit=args.limit
+                vault_dir,
+                metadata_path,
+                rules_path,
+                args.topic,
+                limit=args.limit,
+                mode=args.mode,
+                max_chars=args.max_chars,
+                max_entry_chars=args.max_entry_chars,
             )
             payload = {"status": "ok", **ctx}
             lines = [
-                f"Topic: {' > '.join(ctx['topic_path'])} ({ctx['total_entries']} entries)",
+                f"Topic: {' > '.join(ctx['topic_path'])} ({ctx['total_entries']} entries, mode={ctx['mode']})",
                 f"Review file: {ctx['review_path'] or '(none)'}",
             ]
             if ctx["review_markdown"]:
                 lines.extend(["", ctx["review_markdown"].rstrip()])
+            elif ctx["mode"] == "index":
+                for item in ctx["entries"]:
+                    lines.append(
+                        f"- [{item['source_id']}] {item['date']} · {item['title']} "
+                        f"({item.get('kind') or 'note'}): {item.get('summary') or ''}"
+                    )
             _emit(payload, args.json, lines)
             return 0
 
@@ -914,8 +1037,11 @@ def main(argv=None):
                 query=args.query,
                 file_filter=args.file,
                 kind_filter=args.kind,
+                commit_filter=args.commit,
                 topic_filter=args.topic,
                 limit=args.limit,
+                max_chars=args.max_chars,
+                max_entry_chars=args.max_entry_chars,
             )
             payload = {"status": "ok", **res}
             lines = [f"Matches: {res['total_matches']}"]
@@ -925,8 +1051,9 @@ def main(argv=None):
                 cat_str = " > ".join(item["categories"][0]) if item["categories"] else "Unclassified"
                 kind_tag = f" [{item['kind']}]" if item.get("kind") else ""
                 files_tag = f" (files: {', '.join(item['files'])})" if item.get("files") else ""
+                commit_tag = f" @{item['commit']}" if item.get("commit") else ""
                 lines.append(
-                    f"- [{item['source_id']}] {item['date']} · {cat_str} · {item['title']}{kind_tag}{files_tag}"
+                    f"- [{item['source_id']}] {item['date']} · {cat_str} · {item['title']}{kind_tag}{files_tag}{commit_tag}"
                 )
             _emit(payload, args.json, lines)
             return 0
@@ -994,18 +1121,22 @@ def main(argv=None):
                 vault_dir, tree, args.id, entry
             )
             meta = extract_entry_metadata(unit.content)
+            content_out, was_trunc = _truncate_text(unit.content, args.max_chars)
             payload = {
                 "status": "ok",
                 "source_id": args.id,
                 "kind": meta["kind"],
                 "files": meta["files"],
+                "commit": meta["commit"],
+                "summary": meta["summary"],
                 **entry,
-                "content": unit.content,
+                "content": content_out,
+                "truncated": was_trunc,
             }
             _emit(
                 payload,
                 args.json,
-                [f"Source ID: {args.id} ({entry.get('source_path')}:{entry.get('source_line')})", "", unit.content],
+                [f"Source ID: {args.id} ({entry.get('source_path')}:{entry.get('source_line')})", "", content_out],
             )
             return 0
 
@@ -1015,8 +1146,8 @@ def main(argv=None):
             view_argv = ["--port", str(args.port), "--vault-dir", vault_dir]
             if args.no_browser:
                 view_argv.append("--no-browser")
-            if args.no_refresh:
-                view_argv.append("--no-refresh")
+            if args.refresh and not args.no_refresh:
+                view_argv.append("--refresh")
             return workspace_viewer.main(view_argv)
 
     except ProcessLockUnavailable as exc:

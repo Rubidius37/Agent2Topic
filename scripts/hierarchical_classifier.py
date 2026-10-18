@@ -23,8 +23,8 @@ from process_lock import (
 from document_utils import (
     AUTO_GENERATED_REVIEW, AUTO_GENERATED_SUBJECT, IMAGE_TOKEN_RE,
     _is_within_directory, _normalize_image_target, _resolve_source_image_path,
-    cleanup_generated_root, escape_markdown_link_label, is_prefix,
-    make_markdown_link, normalize_rel_path, parse_stem_date,
+    cleanup_generated_root, escape_markdown_link_label, extract_entry_metadata,
+    is_prefix, make_markdown_link, normalize_rel_path, parse_stem_date,
     sanitize_filename, source_date_key, strip_markdown_target_title,
 )
 from workspace_paths import resolve_workspace_dir, resolve_workspace_state_dir
@@ -41,6 +41,8 @@ PRODUCTION_REVIEW_DIR = "Topic_Reviews"
 PRODUCTION_METADATA_FILE = "organizer_metadata.json"
 SOURCE_ID_MARKER_NAME = "research-notes-source-id"
 HEADING_RE = re.compile(r"^(#{1,5})[ \t]+(.*?)[ \t]*$")
+ENTRY_HEADING_RE = re.compile(r"^######[ \t]+(.*?)[ \t]*$")
+ANY_UNIT_HEADING_RE = re.compile(r"^(#{1,6})[ \t]+(.*?)[ \t]*$")
 CATEGORY_LINE_RE = re.compile(r"^(Category|분류)\s*:\s*(.*)$", re.IGNORECASE)
 SOURCE_ID_RE = re.compile(
     r"<!--\s*(?:[a-zA-Z0-9][a-zA-Z0-9_-]*-)?source-id\s*:\s*"
@@ -305,6 +307,21 @@ def parse_markdown_into_units(filepath, tree, content=None):
         current = None
 
     for line_number, (line, in_code) in enumerate(source_lines_with_code_context(content), 1):
+        entry_match = None if in_code or is_markdown_blockquote_line(line) else ENTRY_HEADING_RE.match(line)
+        if entry_match:
+            entry_title = entry_match.group(1).strip()
+            if entry_title:
+                finish_current()
+                current = SourceUnit(
+                    title=entry_title,
+                    lines=[line],
+                    category_path=category_context,
+                    heading_path=tuple(value for value in heading_context if value),
+                    start_line=line_number,
+                )
+                first_heading = False
+                continue
+
         match = None if in_code else HEADING_RE.match(line)
         if not match:
             if current is None:
@@ -425,7 +442,7 @@ def iter_active_category_lines(content):
             if match:
                 yield index, match
             continue
-        if HEADING_RE.match(raw_line) or SOURCE_ID_RE.fullmatch(stripped):
+        if ANY_UNIT_HEADING_RE.match(raw_line) or SOURCE_ID_RE.fullmatch(stripped):
             recent_structural_line = True
             continue
         checked_after_header += 1
@@ -588,7 +605,7 @@ def classify_unit(unit, tree, level1_hint=None, previous_entry=None):
 
 
 def is_meaningless_content(content):
-    body = re.sub(r"^#{1,5}\s+.*$", "", content, flags=re.MULTILINE)
+    body = re.sub(r"^#{1,6}\s+.*$", "", content, flags=re.MULTILINE)
     body = SOURCE_ID_RE.sub("", body)
     body = re.sub(r"[-*_\s]", "", body)
     return not body
@@ -838,10 +855,15 @@ def find_source_id_relocations(units, tree):
             continue
         if is_meaningless_content(child_classification["content"]):
             continue
+        is_entry_child = (
+            child.category_path == parent.category_path
+            and bool(child.lines)
+            and ENTRY_HEADING_RE.match(child.lines[0]) is not None
+        )
         if (
             not parent.category_path
             or not is_prefix(parent.category_path, child.category_path)
-            or len(child.category_path) <= len(parent.category_path)
+            or (len(child.category_path) <= len(parent.category_path) and not is_entry_child)
         ):
             continue
         source_line, source_id = parent_markers[0]
@@ -913,7 +935,7 @@ def render_source_id_markers(original_content, markers, relocations=(), consolid
         if child_cat_line is not None:
             continue
         raw_items = [item.strip() for item in cat_match.group(2).split(",") if item.strip()]
-        target_heading = HEADING_RE.match(lines[target_line - 1]) if 0 <= target_line - 1 < len(lines) else None
+        target_heading = ANY_UNIT_HEADING_RE.match(lines[target_line - 1]) if 0 <= target_line - 1 < len(lines) else None
         target_name = normalize_name(target_heading.group(2)) if target_heading else ""
         if len(raw_items) == 1:
             parts = [p.strip() for p in re.split(r"[/>]", raw_items[0]) if p.strip()]
@@ -981,7 +1003,7 @@ def render_source_id_markers(original_content, markers, relocations=(), consolid
             )
         is_heading = (
             start_index < len(lines)
-            and HEADING_RE.match(lines[start_index]) is not None
+            and ANY_UNIT_HEADING_RE.match(lines[start_index]) is not None
         )
         if is_heading:
             insert_index = start_index + 1
@@ -1099,7 +1121,7 @@ def build_source_marker_plans(
                             next_line = unit.start_line + offset
                             break
                     keep = found_markers[0][1]
-                    if unit.lines and HEADING_RE.match(unit.lines[0]):
+                    if unit.lines and ANY_UNIT_HEADING_RE.match(unit.lines[0]):
                         keep = next((source_id for line, source_id in found_markers
                                      if line == next_line), keep)
                     consolidations.append((unit.start_line, keep, found_markers))
@@ -1114,7 +1136,7 @@ def build_source_marker_plans(
                     markers.append((unit.start_line, relocated_id))
                     existing_count += 1
                     first_line = unit.content.splitlines()[0] if unit.content else ""
-                    if HEADING_RE.match(first_line):
+                    if ANY_UNIT_HEADING_RE.match(first_line):
                         heading_count += 1
                     else:
                         document_root_count += 1
@@ -1135,7 +1157,7 @@ def build_source_marker_plans(
                     existing_count += 1
                 markers.append((unit.start_line, source_id))
                 first_line = unit.content.splitlines()[0] if unit.content else ""
-                if HEADING_RE.match(first_line):
+                if ANY_UNIT_HEADING_RE.match(first_line):
                     heading_count += 1
                 else:
                     document_root_count += 1
@@ -1839,9 +1861,11 @@ def _main_unlocked(argv=None):
                     else:
                         manual_heading_path = list(unit.heading_path)
 
+                entry_meta = extract_entry_metadata(classification["content"])
                 entry_record = {
                     "source_path": source_rel_path,
                     "source_log": log_name,
+                    "date": source_date_key(source_rel_path),
                     "source_heading": unit.title,
                     "source_heading_path": list(unit.heading_path),
                     "source_line": unit.start_line,
@@ -1858,6 +1882,11 @@ def _main_unlocked(argv=None):
                         for path in classification["paths"]
                     ],
                     "generated_paths": generated_paths,
+                    "kind": entry_meta["kind"],
+                    "files": entry_meta["files"],
+                    "commit": entry_meta["commit"],
+                    "summary": entry_meta["summary"],
+                    "search_text": entry_meta["search_text"],
                 }
                 if manual_heading_path is not None:
                     entry_record["manual_heading_path"] = manual_heading_path

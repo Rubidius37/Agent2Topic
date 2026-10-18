@@ -393,7 +393,8 @@ def parse_args(argv=None):
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--vault-dir", default=None)
     parser.add_argument("--no-browser", action="store_true")
-    parser.add_argument("--no-refresh", action="store_true")
+    parser.add_argument("--refresh", action="store_true", help="Run classifier update before starting viewer.")
+    parser.add_argument("--no-refresh", action="store_true", help=argparse.SUPPRESS)
     return parser.parse_args(argv)
 
 
@@ -411,7 +412,7 @@ def main(argv=None):
 
     vault_dir = os.path.abspath(args.vault_dir) if args.vault_dir else DEFAULT_VAULT_DIR
     daily_dir = os.path.join(vault_dir, "Daily_Logs")
-    if not args.no_refresh and count_daily_markdown_files(daily_dir) > 0:
+    if args.refresh and not args.no_refresh and count_daily_markdown_files(daily_dir) > 0:
         print("Refreshing local Subject/ and Topic_Reviews/ before opening viewer...")
         initial = run_production_classifier(vault_dir)
         if not initial["ok"]:
