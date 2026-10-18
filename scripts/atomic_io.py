@@ -1,5 +1,6 @@
 import json
 import os
+import stat
 import tempfile
 
 
@@ -18,12 +19,27 @@ def filesystem_path(path):
     return "\\\\?\\" + absolute
 
 
+def _default_new_file_mode():
+    umask = os.umask(0)
+    os.umask(umask)
+    return 0o666 & ~umask
+
+
 def atomic_write_text(path, content, encoding="utf-8"):
-    absolute_path = filesystem_path(os.path.abspath(path))
+    raw_abs = os.path.abspath(path)
+    target_abs = os.path.realpath(raw_abs) if os.path.islink(raw_abs) else raw_abs
+    absolute_path = filesystem_path(target_abs)
     directory = os.path.dirname(absolute_path)
     os.makedirs(directory, exist_ok=True)
+
+    existing_mode = None
+    try:
+        existing_mode = stat.S_IMODE(os.stat(absolute_path).st_mode)
+    except OSError:
+        existing_mode = None
+
     descriptor, temp_path = tempfile.mkstemp(
-        prefix=f".research-notes-{os.path.basename(absolute_path)}-",
+        prefix=f".research-notes-{os.path.basename(target_abs)}-",
         suffix=".tmp",
         dir=directory,
     )
@@ -37,6 +53,11 @@ def atomic_write_text(path, content, encoding="utf-8"):
             file_obj.write(content)
             file_obj.flush()
             os.fsync(file_obj.fileno())
+        try:
+            target_mode = existing_mode if existing_mode is not None else _default_new_file_mode()
+            os.chmod(temp_path, target_mode)
+        except OSError:
+            pass
         os.replace(temp_path, absolute_path)
     except Exception:
         try:

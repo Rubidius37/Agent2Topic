@@ -29,6 +29,21 @@ class AtomicStateTests(unittest.TestCase):
                 self.assertEqual(json.load(file_obj), {"new": "값"})
             self.assertEqual(os.listdir(temp_dir), ["state.json"])
 
+    def test_atomic_write_text_preserves_existing_file_permissions(self):
+        import stat
+        from atomic_io import atomic_write_text
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = os.path.join(temp_dir, "note.md")
+            with open(path, "w", encoding="utf-8") as file_obj:
+                file_obj.write("initial")
+            os.chmod(path, 0o644)
+            before_mode = stat.S_IMODE(os.stat(path).st_mode)
+
+            atomic_write_text(path, "updated")
+            after_mode = stat.S_IMODE(os.stat(path).st_mode)
+            self.assertEqual(before_mode, after_mode)
+
     def test_replace_failure_preserves_old_file_and_removes_temp_file(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             path = os.path.join(temp_dir, "state.json")

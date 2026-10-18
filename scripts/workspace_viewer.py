@@ -20,6 +20,7 @@ from review_ops import (
     DASHBOARD_SESSION_ID_RE,
     DashboardLifecycle,
     ReviewError,
+    is_allowed_local_host,
     is_local_origin,
     resolve_ui_language,
     run_production_classifier,
@@ -329,10 +330,20 @@ class WorkspaceViewerHandler(BaseHTTPRequestHandler):
             self.server.dashboard_lifecycle.close(connection_id)
             self.close_connection = True
 
+    def validate_request_security(self):
+        if not is_allowed_local_host(self.headers.get("Host")):
+            raise ReviewError("Forbidden Host header (DNS rebinding protection).", HTTPStatus.FORBIDDEN)
+        if not is_local_origin(self.headers.get("Origin")):
+            raise ReviewError("Forbidden request origin.", HTTPStatus.FORBIDDEN)
+        sec_fetch_site = self.headers.get("Sec-Fetch-Site", "").strip().casefold()
+        if sec_fetch_site == "cross-site":
+            raise ReviewError("Cross-site requests are forbidden.", HTTPStatus.FORBIDDEN)
+
     def do_GET(self):
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path
         try:
+            self.validate_request_security()
             if path in {"/", "/index.html"}:
                 self.send_static("index.html", "text/html; charset=utf-8")
             elif path == "/viewer.css":
@@ -367,11 +378,13 @@ class WorkspaceViewerHandler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         path = urllib.parse.urlparse(self.path).path
+        try:
+            self.validate_request_security()
+        except ReviewError as exc:
+            self.send_error_json(exc)
+            return
         if path not in {"/api/session/open", "/api/session/close"}:
             self.send_error(HTTPStatus.NOT_FOUND)
-            return
-        if not is_local_origin(self.headers.get("Origin")):
-            self.send_error_json(ReviewError("Forbidden request origin.", HTTPStatus.FORBIDDEN))
             return
         try:
             payload = self.read_json_payload()

@@ -122,6 +122,25 @@ class WorkspaceViewerTests(unittest.TestCase):
                 urllib.request.urlopen(f"{base_url}/api/file?path=../../secret.md", timeout=5)
             self.assertIn(err.exception.code, (400, 403))
 
+            # 4b. DNS Rebinding (Host: evil.example.com) and Cross-Site GET are blocked with 403
+            req_rebind = urllib.request.Request(
+                f"{base_url}/api/tree",
+                headers={"Host": "evil.example.com:8000"},
+                method="GET",
+            )
+            with self.assertRaises(urllib.error.HTTPError) as rebind_err:
+                urllib.request.urlopen(req_rebind, timeout=5)
+            self.assertEqual(rebind_err.exception.code, 403)
+
+            req_cross = urllib.request.Request(
+                f"{base_url}/api/tree",
+                headers={"Sec-Fetch-Site": "cross-site"},
+                method="GET",
+            )
+            with self.assertRaises(urllib.error.HTTPError) as cross_err:
+                urllib.request.urlopen(req_cross, timeout=5)
+            self.assertEqual(cross_err.exception.code, 403)
+
             # 5. Open and close session -> server shuts down automatically
             req_open = urllib.request.Request(
                 f"{base_url}/api/session/open",

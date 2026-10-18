@@ -804,7 +804,8 @@ def resolve_source_id(
     if source_id in used_ids and marker:
         raise RuntimeError(
             f"Duplicate permanent Source ID '{source_id}' in "
-            f"{source_rel_path}:{unit.start_line}."
+            f"{source_rel_path}:{unit.start_line}. "
+            "Delete the copied HTML comment or run 'pagent update --rebuild-ids'."
         )
     if source_id in used_ids:
         anchor = make_source_anchor(source_rel_path, unit)
@@ -1094,9 +1095,12 @@ def build_source_marker_plans(
                 owner = (source_rel_path, unit.start_line)
                 for _line, source_id in unit_source_id_markers(unit):
                     if source_id in marker_owners and marker_owners[source_id] != owner:
+                        first_path, first_line = marker_owners[source_id]
                         raise RuntimeError(
                             f"Duplicate permanent Source ID '{source_id}' in "
-                            f"{source_rel_path}:{unit.start_line}"
+                            f"{source_rel_path}:{unit.start_line} "
+                            f"(first seen at {first_path}:{first_line}). "
+                            "Delete the copied HTML comment or run 'pagent update --rebuild-ids'."
                         )
                     marker_owners[source_id] = owner
             relocated_targets = {

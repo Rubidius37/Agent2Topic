@@ -569,4 +569,14 @@ def is_local_origin(origin):
     if not origin:
         return True
     parsed = urllib.parse.urlparse(origin)
-    return parsed.hostname in {"127.0.0.1", "localhost"}
+    return parsed.hostname in {"127.0.0.1", "localhost", "::1"}
+
+
+def is_allowed_local_host(host_header):
+    if not host_header:
+        return False
+    raw = str(host_header).strip()
+    if not raw or "/" in raw or "@" in raw or " " in raw:
+        return False
+    parsed = urllib.parse.urlparse(f"http://{raw}")
+    return parsed.hostname in {"127.0.0.1", "localhost", "::1"}
