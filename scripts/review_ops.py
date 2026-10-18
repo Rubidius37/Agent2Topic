@@ -536,6 +536,7 @@ def remove_manual_categories(
 def run_production_classifier(vault_dir=VAULT_DIR, lock_held_by_parent=False, extra_args=()):
     command = [
         sys.executable,
+        "-B",
         os.path.join(SCRIPT_DIR, "hierarchical_classifier.py"),
         "--vault-dir",
         os.path.abspath(vault_dir),

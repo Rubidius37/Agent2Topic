@@ -251,13 +251,18 @@ def cleanup_generated_root(vault_dir, root_name, desired_paths, marker):
 KIND_META_RE = re.compile(r"^\*\*Kind\*\*\s*:\s*(.+?)\s*$", re.IGNORECASE)
 FILES_META_RE = re.compile(r"^\*\*Files\*\*\s*:\s*(.+?)\s*$", re.IGNORECASE)
 COMMIT_META_RE = re.compile(r"^\*\*Commit\*\*\s*:\s*(.+?)\s*$", re.IGNORECASE)
+AGENT_META_RE = re.compile(r"^\*\*Agent\*\*\s*:\s*(.+?)\s*$", re.IGNORECASE)
+SESSION_META_RE = re.compile(r"^\*\*Session\*\*\s*:\s*(.+?)\s*$", re.IGNORECASE)
 INLINE_FILE_PATH_RE = re.compile(r"`([A-Za-z0-9_./\\-]+\.[A-Za-z0-9]{1,10})`")
+SEARCH_TEXT_INDEX_LIMIT = 4000
 
 
 def extract_entry_metadata(content):
-    """Extract Kind, Files, Commit, Summary, and Search Text from a SourceUnit body."""
+    """Extract Kind, Files, Commit, Agent, Session, Summary, and Search Text from a SourceUnit body."""
     kind = None
     commit = None
+    agent = None
+    session = None
     files = []
     seen_files = set()
     body_lines = []
@@ -307,6 +312,16 @@ def extract_entry_metadata(content):
             if commit is None:
                 commit = m_commit.group(1).strip().strip("`")
             continue
+        m_agent = AGENT_META_RE.match(stripped)
+        if m_agent:
+            if agent is None:
+                agent = m_agent.group(1).strip().strip("`")
+            continue
+        m_session = SESSION_META_RE.match(stripped)
+        if m_session:
+            if session is None:
+                session = m_session.group(1).strip().strip("`")
+            continue
 
         for match in INLINE_FILE_PATH_RE.finditer(raw_line):
             add_file(match.group(1))
@@ -319,6 +334,9 @@ def extract_entry_metadata(content):
         "kind": kind,
         "files": files,
         "commit": commit,
+        "agent": agent,
+        "session": session,
         "summary": summary,
-        "search_text": clean_text[:4000],
+        "search_text": clean_text[:SEARCH_TEXT_INDEX_LIMIT],
+        "search_text_truncated": len(clean_text) > SEARCH_TEXT_INDEX_LIMIT,
     }

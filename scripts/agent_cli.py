@@ -53,7 +53,7 @@ from workspace_paths import (
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_VAULT_DIR = resolve_workspace_dir(SCRIPT_DIR)
-PAGENT_VERSION = "0.3.0"
+PAGENT_VERSION = "0.3.1"
 DEFAULT_GITHUB_REPO = "Rubidius37/Project_Agent"
 
 DEFAULT_CONTEXT_MAX_CHARS = 12000
@@ -152,15 +152,135 @@ def detect_git_head_commit(cwd=None):
 
 def _truncate_text(text, limit, source_id=None):
     raw = str(text or "")
-    if limit is None or limit <= 0 or len(raw) <= limit:
+    if limit is None or limit < 0:
         return raw, False
+    if len(raw) <= limit:
+        return raw, False
+    if limit == 0:
+        return "", bool(raw)
     suffix = (
         f"\n...(truncated; run 'pagent source --id {source_id}' for full text)"
-        if source_id
-        else "\n...(truncated)"
+        if source_id and limit >= 80
+        else "…"
     )
+    if limit <= len(suffix):
+        return raw[: max(0, limit - 1)] + ("…" if limit >= 1 else ""), True
     keep = max(0, limit - len(suffix))
     return raw[:keep].rstrip() + suffix, True
+
+
+def _json_len(payload):
+    return len(json.dumps(payload, indent=2, ensure_ascii=False))
+
+
+def _fit_string_field_to_budget(payload, field_name, full_text, budget, source_id=None):
+    """Truncate payload[field_name] so that _json_len(payload) <= budget."""
+    if not full_text:
+        payload[field_name] = full_text
+        return False
+    payload[field_name] = full_text
+    if _json_len(payload) <= budget:
+        return False
+
+    low, high = 0, len(full_text)
+    best_text = ""
+    while low <= high:
+        mid = (low + high) // 2
+        candidate, _ = _truncate_text(full_text, mid, source_id=source_id)
+        payload[field_name] = candidate
+        if _json_len(payload) <= budget:
+            best_text = candidate
+            low = mid + 1
+        else:
+            high = mid - 1
+    payload[field_name] = best_text
+    return True
+
+
+def _pack_entries_within_budget(
+    payload,
+    list_key,
+    candidate_entries,
+    total_count,
+    offset,
+    limit,
+    budget,
+):
+    """Pack candidate entries into payload[list_key] without exceeding serialized JSON budget."""
+    sliced = candidate_entries[offset : offset + max(0, int(limit))]
+    payload[list_key] = []
+    payload["offset"] = offset
+    payload["returned_entries"] = 0
+    payload["has_more"] = (offset + len(sliced)) < total_count
+    payload["next_offset"] = (offset + len(sliced)) if payload["has_more"] else None
+
+    if budget is None:
+        payload[list_key] = sliced
+        payload["returned_entries"] = len(sliced)
+        return
+
+    for idx, raw_item in enumerate(sliced):
+        item = dict(raw_item)
+        full_content = item.get("content", "")
+        full_summary = item.get("summary", "")
+
+        payload[list_key].append(item)
+        payload["returned_entries"] = len(payload[list_key])
+        more_after_this = (offset + idx + 1) < total_count
+        payload["has_more"] = more_after_this
+        payload["next_offset"] = (offset + idx + 1) if more_after_this else None
+
+        if _json_len(payload) <= budget:
+            continue
+
+        # Try shrinking content (and summary if needed) to fit within remaining budget
+        payload["budget_truncated"] = True
+        item["content"] = ""
+        item["truncated"] = True
+        if _json_len(payload) > budget:
+            # Even with empty content it doesn't fit; try shrinking summary too
+            item["summary"] = ""
+            if _json_len(payload) > budget:
+                # Skeleton itself doesn't fit; remove item and stop
+                payload[list_key].pop()
+                payload["returned_entries"] = len(payload[list_key])
+                payload["has_more"] = (offset + idx) < total_count
+                payload["next_offset"] = (offset + idx) if payload["has_more"] else None
+                break
+
+        # Binary-search how much content we can keep while staying <= budget
+        low, high = 0, len(full_content)
+        best_content = ""
+        sid = item.get("source_id")
+        while low <= high:
+            mid = (low + high) // 2
+            cand, _ = _truncate_text(full_content, mid, source_id=sid)
+            item["content"] = cand
+            if _json_len(payload) <= budget:
+                best_content = cand
+                low = mid + 1
+            else:
+                high = mid - 1
+        item["content"] = best_content
+        if full_summary and not item["summary"]:
+            low_s, high_s = 0, len(full_summary)
+            best_s = ""
+            while low_s <= high_s:
+                mid_s = (low_s + high_s) // 2
+                cand_s, _ = _truncate_text(full_summary, mid_s)
+                item["summary"] = cand_s
+                if _json_len(payload) <= budget:
+                    best_s = cand_s
+                    low_s = mid_s + 1
+                else:
+                    high_s = mid_s - 1
+            item["summary"] = best_s
+
+        # If more items remain in sliced, mark has_more and stop packing
+        if (offset + idx + 1) < total_count:
+            payload["has_more"] = True
+            payload["next_offset"] = offset + idx + 1
+        break
 
 
 def ensure_workspace_initialized(vault_dir):
@@ -332,13 +452,11 @@ def _determine_headings_to_emit(existing_filepath, tree, resolved, merge_same_to
     ):
         return full_headings, False
 
-    # Same active topic at EOF -> reuse parent H1-H5 headings without repeating them
     if len(last_cat) == len(resolved) and all(
         normalize_name(a) == normalize_name(b) for a, b in zip(last_cat, resolved)
     ):
         return [], True
 
-    # Shared prefix -> emit only diverging H2-H5 headings
     common_len = 0
     for a, b in zip(last_cat, resolved):
         if normalize_name(a) == normalize_name(b):
@@ -364,6 +482,8 @@ def append_log_entry(
     files=None,
     kind=None,
     commit=None,
+    agent=None,
+    session=None,
     merge_same_topic=True,
 ):
     parts = split_category_path(raw_category_path)
@@ -412,6 +532,8 @@ def append_log_entry(
     normalized_files = parse_file_list(files)
     normalized_kind = str(kind or "").strip().lower() or None
     normalized_commit = str(commit or "").strip() or None
+    normalized_agent = str(agent or "").strip() or None
+    normalized_session = str(session or "").strip() or None
 
     meta_lines = []
     if normalized_kind:
@@ -421,6 +543,10 @@ def append_log_entry(
         meta_lines.append(f"**Files**: {formatted_files}")
     if normalized_commit:
         meta_lines.append(f"**Commit**: `{normalized_commit}`")
+    if normalized_agent:
+        meta_lines.append(f"**Agent**: `{normalized_agent}`")
+    if normalized_session:
+        meta_lines.append(f"**Session**: `{normalized_session}`")
     if meta_lines:
         body = "\n".join(meta_lines) + "\n\n" + body
 
@@ -458,6 +584,8 @@ def append_log_entry(
         "kind": normalized_kind,
         "files": normalized_files,
         "commit": normalized_commit,
+        "agent": normalized_agent,
+        "session": normalized_session,
         "reused_topic_headings": reused_topic_headings,
         "merged_into_last_unit": reused_topic_headings,
     }
@@ -488,18 +616,40 @@ def _get_entry_meta_and_text(vault_dir, tree, source_id, entry, need_full_conten
         except Exception:
             raw_content = ""
 
-    if has_indexed:
+    if has_indexed and not need_full_content:
         meta = {
             "kind": entry.get("kind"),
             "files": list(entry.get("files") or []),
             "commit": entry.get("commit"),
+            "agent": entry.get("agent"),
+            "session": entry.get("session"),
             "summary": entry.get("summary", ""),
             "search_text": entry.get("search_text", ""),
+            "search_text_truncated": bool(entry.get("search_text_truncated", False)),
         }
     else:
-        meta = extract_entry_metadata(raw_content or "")
+        extracted = extract_entry_metadata(raw_content or "")
+        meta = {
+            "kind": entry.get("kind") if has_indexed else extracted["kind"],
+            "files": list(entry.get("files") or extracted["files"]),
+            "commit": entry.get("commit") if has_indexed else extracted["commit"],
+            "agent": entry.get("agent") if has_indexed else extracted["agent"],
+            "session": entry.get("session") if has_indexed else extracted["session"],
+            "summary": entry.get("summary") if has_indexed else extracted["summary"],
+            "search_text": raw_content if raw_content is not None else extracted["search_text"],
+            "search_text_truncated": bool(entry.get("search_text_truncated", False)),
+        }
 
     return meta, raw_content
+
+
+def _validate_max_chars(max_chars):
+    if max_chars is None:
+        return None
+    val = int(max_chars)
+    if val <= 0:
+        raise ValueError("--max-chars must be a positive integer.")
+    return val
 
 
 def query_topic_context(
@@ -508,10 +658,13 @@ def query_topic_context(
     rules_path,
     raw_topic_path,
     limit=5,
+    offset=0,
     mode="review",
     max_chars=DEFAULT_CONTEXT_MAX_CHARS,
     max_entry_chars=None,
 ):
+    budget = _validate_max_chars(max_chars)
+    offset = max(0, int(offset or 0))
     parts = split_category_path(raw_topic_path)
     tree = parse_rules_from_markdown(rules_path)
     resolved = tree.resolve_manual_path(parts) or tuple(parts)
@@ -550,33 +703,33 @@ def query_topic_context(
 
     candidates.sort(key=lambda item: (item[0], item[1], item[2]), reverse=True)
     total_entries = len(candidates)
-    selected_candidates = candidates[: max(0, int(limit))]
 
     review_rel_path = _find_review_path_for_category(vault_dir, resolved)
-    review_content = None
-    review_truncated = False
-    remaining_budget = max(500, int(max_chars)) if max_chars and max_chars > 0 else None
-
-    if mode != "index" and review_rel_path:
+    raw_review = None
+    if mode == "review" and review_rel_path:
         full_rev = os.path.join(vault_dir, *review_rel_path.split("/"))
         if os.path.isfile(filesystem_path(full_rev)):
             with open(filesystem_path(full_rev), "r", encoding="utf-8") as file_obj:
-                raw_rev = file_obj.read()
-            if remaining_budget is not None:
-                rev_cap = remaining_budget if mode == "review" else max(1000, remaining_budget // 2)
-                review_content, review_truncated = _truncate_text(raw_rev, rev_cap)
-                remaining_budget = max(0, remaining_budget - len(review_content))
-            else:
-                review_content = raw_rev
+                raw_review = file_obj.read()
 
-    matched_entries = []
-    budget_truncated = review_truncated
     need_body = mode in {"review", "entries"}
+    prepared_entries = []
+    any_entry_truncated = False
 
-    for entry_date, source_rel, source_line, source_id, entry, matched_cats in selected_candidates:
+    for entry_date, source_rel, source_line, source_id, entry, matched_cats in candidates:
         meta, raw_content = _get_entry_meta_and_text(
             vault_dir, tree, source_id, entry, need_full_content=need_body
         )
+        if mode == "index":
+            body_text, was_trunc = _truncate_text(meta["summary"], max_entry_chars, source_id=source_id)
+        else:
+            body_text, was_trunc = _truncate_text(
+                raw_content if raw_content is not None else meta["summary"],
+                max_entry_chars,
+                source_id=source_id,
+            )
+        if was_trunc:
+            any_entry_truncated = True
         item = {
             "source_id": source_id,
             "date": entry_date,
@@ -586,42 +739,46 @@ def query_topic_context(
             "kind": meta["kind"],
             "files": meta["files"],
             "commit": meta["commit"],
+            "agent": meta["agent"],
+            "session": meta["session"],
             "summary": meta["summary"],
             "categories": [list(cat) for cat in matched_cats],
             "generated_paths": entry.get("generated_paths", []),
+            "content": body_text,
+            "truncated": was_trunc,
         }
-        if mode == "index":
-            item["content"] = meta["summary"]
-            item["truncated"] = False
-        else:
-            effective_cap = max_entry_chars
-            if remaining_budget is not None:
-                if remaining_budget <= 120:
-                    item["content"] = meta["summary"]
-                    item["truncated"] = True
-                    budget_truncated = True
-                    matched_entries.append(item)
-                    continue
-                effective_cap = min(effective_cap, remaining_budget) if effective_cap else remaining_budget
-            bounded_text, was_trunc = _truncate_text(raw_content or meta["summary"], effective_cap, source_id=source_id)
-            item["content"] = bounded_text
-            item["truncated"] = was_trunc
-            if was_trunc:
-                budget_truncated = True
-            if remaining_budget is not None:
-                remaining_budget = max(0, remaining_budget - len(bounded_text))
-        matched_entries.append(item)
+        prepared_entries.append(item)
 
-    return {
+    payload = {
+        "status": "ok",
         "topic_path": list(resolved),
         "mode": mode,
-        "max_chars": max_chars,
-        "budget_truncated": budget_truncated,
-        "review_path": review_rel_path,
-        "review_markdown": review_content,
+        "max_chars": budget,
+        "budget_truncated": any_entry_truncated,
+        "review_path": review_rel_path if mode == "review" else None,
+        "review_markdown": raw_review if mode == "review" else None,
         "total_entries": total_entries,
-        "entries": matched_entries,
+        "offset": offset,
+        "returned_entries": 0,
+        "has_more": False,
+        "next_offset": None,
+        "entries": [],
     }
+
+    if budget is not None and mode == "review" and raw_review is not None:
+        if _fit_string_field_to_budget(payload, "review_markdown", raw_review, budget):
+            payload["budget_truncated"] = True
+
+    _pack_entries_within_budget(
+        payload,
+        "entries",
+        prepared_entries,
+        total_entries,
+        offset,
+        limit,
+        budget,
+    )
+    return payload
 
 
 def search_workspace_entries(
@@ -632,11 +789,17 @@ def search_workspace_entries(
     file_filter=None,
     kind_filter=None,
     commit_filter=None,
+    agent_filter=None,
+    session_filter=None,
     topic_filter=None,
+    deep=False,
     limit=10,
+    offset=0,
     max_chars=DEFAULT_CONTEXT_MAX_CHARS,
     max_entry_chars=DEFAULT_SEARCH_ENTRY_CHARS,
 ):
+    budget = _validate_max_chars(max_chars)
+    offset = max(0, int(offset or 0))
     tree = parse_rules_from_markdown(rules_path)
     norm_topic_prefix = None
     if topic_filter:
@@ -652,6 +815,8 @@ def search_workspace_entries(
     )
     norm_kind_filter = str(kind_filter or "").strip().casefold() if kind_filter else None
     norm_commit_filter = str(commit_filter or "").strip().casefold() if commit_filter else None
+    norm_agent_filter = str(agent_filter or "").strip().casefold() if agent_filter else None
+    norm_session_filter = str(session_filter or "").strip().casefold() if session_filter else None
 
     metadata = load_metadata(metadata_path) if os.path.isfile(metadata_path) else {}
     entries = metadata.get("entries", {}) if isinstance(metadata, dict) else {}
@@ -678,7 +843,7 @@ def search_workspace_entries(
                 continue
 
         meta, _unused = _get_entry_meta_and_text(
-            vault_dir, tree, source_id, entry, need_full_content=False
+            vault_dir, tree, source_id, entry, need_full_content=bool(deep)
         )
 
         if norm_kind_filter and (meta["kind"] or "").casefold() != norm_kind_filter:
@@ -689,26 +854,46 @@ def search_workspace_entries(
             if not entry_commit or not entry_commit.startswith(norm_commit_filter):
                 continue
 
-        if norm_file_filter:
-            file_hit = any(norm_file_filter in f.casefold() for f in meta["files"]) or (
-                norm_file_filter in normalize_rel_path(meta["search_text"]).casefold()
-            )
-            if not file_hit:
-                continue
+        if norm_agent_filter and (meta["agent"] or "").casefold() != norm_agent_filter:
+            continue
 
-        if query_terms:
-            haystack = " ".join(
-                [
-                    entry.get("source_heading", ""),
-                    " ".join("/".join(cat) for cat in matched_cats),
-                    " ".join(meta["files"]),
-                    meta["kind"] or "",
-                    meta["commit"] or "",
-                    meta["search_text"],
-                ]
-            ).casefold()
-            if not all(term in haystack for term in query_terms):
-                continue
+        if norm_session_filter and (meta["session"] or "").casefold() != norm_session_filter:
+            continue
+
+        def matches_file_and_query(current_meta):
+            if norm_file_filter:
+                f_hit = any(norm_file_filter in f.casefold() for f in current_meta["files"]) or (
+                    norm_file_filter in normalize_rel_path(current_meta["search_text"]).casefold()
+                )
+                if not f_hit:
+                    return False
+            if query_terms:
+                haystack = " ".join(
+                    [
+                        entry.get("source_heading", ""),
+                        " ".join("/".join(cat) for cat in matched_cats),
+                        " ".join(current_meta["files"]),
+                        current_meta["kind"] or "",
+                        current_meta["commit"] or "",
+                        current_meta["agent"] or "",
+                        current_meta["session"] or "",
+                        current_meta["search_text"],
+                    ]
+                ).casefold()
+                if not all(term in haystack for term in query_terms):
+                    return False
+            return True
+
+        matched = matches_file_and_query(meta)
+        # If the pre-indexed 4,000-char search_text was truncated, fall back to full source content
+        if not matched and not deep and meta.get("search_text_truncated"):
+            meta, _full = _get_entry_meta_and_text(
+                vault_dir, tree, source_id, entry, need_full_content=True
+            )
+            matched = matches_file_and_query(meta)
+
+        if not matched:
+            continue
 
         for cat in matched_cats:
             rev = _find_review_path_for_category(vault_dir, cat)
@@ -725,20 +910,16 @@ def search_workspace_entries(
     matched_raw.sort(key=lambda item: (item[0], item[1], item[2]), reverse=True)
     total_matches = len(matched_raw)
 
-    results = []
-    remaining_budget = max(500, int(max_chars)) if max_chars and max_chars > 0 else None
-    budget_truncated = False
+    prepared_results = []
+    any_preview_truncated = False
 
-    for entry_date, source_rel, source_line, source_id, entry, matched_cats, meta in matched_raw[: max(0, int(limit))]:
-        effective_cap = max_entry_chars
-        if remaining_budget is not None:
-            effective_cap = min(effective_cap, remaining_budget) if effective_cap else remaining_budget
-        preview, was_trunc = _truncate_text(meta["search_text"] or meta["summary"], effective_cap, source_id=source_id)
+    for entry_date, source_rel, source_line, source_id, entry, matched_cats, meta in matched_raw:
+        preview, was_trunc = _truncate_text(
+            meta["search_text"] or meta["summary"], max_entry_chars, source_id=source_id
+        )
         if was_trunc:
-            budget_truncated = True
-        if remaining_budget is not None:
-            remaining_budget = max(0, remaining_budget - len(preview))
-        results.append(
+            any_preview_truncated = True
+        prepared_results.append(
             {
                 "source_id": source_id,
                 "date": entry_date,
@@ -748,6 +929,8 @@ def search_workspace_entries(
                 "kind": meta["kind"],
                 "files": meta["files"],
                 "commit": meta["commit"],
+                "agent": meta["agent"],
+                "session": meta["session"],
                 "summary": meta["summary"],
                 "categories": [list(cat) for cat in matched_cats],
                 "generated_paths": entry.get("generated_paths", []),
@@ -756,17 +939,41 @@ def search_workspace_entries(
             }
         )
 
-    return {
+    payload = {
+        "status": "ok",
         "query": query or "",
         "file": file_filter or "",
         "kind": kind_filter or "",
         "commit": commit_filter or "",
+        "agent": agent_filter or "",
+        "session": session_filter or "",
         "topic": topic_filter or "",
+        "deep": bool(deep),
+        "max_chars": budget,
         "total_matches": total_matches,
-        "budget_truncated": budget_truncated,
+        "offset": offset,
+        "returned_entries": 0,
+        "has_more": False,
+        "next_offset": None,
+        "budget_truncated": any_preview_truncated,
         "related_reviews": sorted(related_reviews),
-        "results": results,
+        "results": [],
     }
+
+    if budget is not None and _json_len(payload) > budget:
+        payload["related_reviews"] = []
+        payload["budget_truncated"] = True
+
+    _pack_entries_within_budget(
+        payload,
+        "results",
+        prepared_results,
+        total_matches,
+        offset,
+        limit,
+        budget,
+    )
+    return payload
 
 
 def _parse_semver_tuple(raw_version):
@@ -875,6 +1082,8 @@ def build_parser():
     p_append.add_argument("--kind", default=None, help="Entry type (e.g. decision, bugfix, experiment, refactor, note).")
     p_append.add_argument("--commit", default=None, help="Git commit SHA associated with this entry.")
     p_append.add_argument("--git", action="store_true", help="Automatically record current Git HEAD short SHA.")
+    p_append.add_argument("--agent", default=None, help="Agent identifier (or set PAGENT_AGENT_ID).")
+    p_append.add_argument("--session", default=None, help="Session identifier (or set PAGENT_SESSION_ID).")
     p_append.add_argument("--date", default=None, help="Log date (YYYY-MM-DD). Defaults to today.")
     p_append.add_argument("--log-file", default=None, help="Specific filename under Daily_Logs/.")
     p_append.add_argument("--create-rule", action="store_true", help="Automatically add the path to Classification_Rules.md if missing.")
@@ -889,21 +1098,26 @@ def build_parser():
         "--mode",
         choices=["review", "index", "entries"],
         default="review",
-        help="Context detail mode: 'index' (metadata only), 'review' (bounded review + summaries), 'entries' (bounded entries).",
+        help="Context detail mode: 'index' (metadata only), 'review' (bounded review + summaries), 'entries' (bounded entries only).",
     )
     p_context.add_argument("--limit", type=int, default=5, help="Max individual entries to return.")
-    p_context.add_argument("--max-chars", type=int, default=DEFAULT_CONTEXT_MAX_CHARS, help="Max total characters to return (default: 12000).")
+    p_context.add_argument("--offset", type=int, default=0, help="Entry pagination offset (default: 0).")
+    p_context.add_argument("--max-chars", type=int, default=DEFAULT_CONTEXT_MAX_CHARS, help="Strict cap on total output characters (default: 12000).")
     p_context.add_argument("--max-entry-chars", type=int, default=None, help="Max characters per individual entry.")
     p_context.add_argument("--json", action="store_true")
 
-    p_search = sub.add_parser("search", help="Search pre-indexed entries by keyword query, modified file path, kind, commit, or topic.")
+    p_search = sub.add_parser("search", help="Search pre-indexed entries by keyword query, modified file path, kind, commit, agent, session, or topic.")
     p_search.add_argument("--query", "-q", default=None, help="Keyword query across headings, categories, and body.")
     p_search.add_argument("--file", "-f", default=None, help="Filter by referenced/modified file path (e.g. 'review_renderer.py').")
     p_search.add_argument("--kind", "-k", default=None, help="Filter by entry kind (e.g. 'decision', 'bugfix').")
     p_search.add_argument("--commit", "-c", default=None, help="Filter by Git commit SHA prefix.")
+    p_search.add_argument("--agent", default=None, help="Filter by Agent identifier.")
+    p_search.add_argument("--session", default=None, help="Filter by Session identifier.")
     p_search.add_argument("--topic", "-t", default=None, help="Optional topic prefix filter.")
+    p_search.add_argument("--deep", action="store_true", help="Force full-text scan of source Markdown files on disk.")
     p_search.add_argument("--limit", type=int, default=10, help="Max matching entries to return (default: 10).")
-    p_search.add_argument("--max-chars", type=int, default=DEFAULT_CONTEXT_MAX_CHARS, help="Max total characters to return (default: 12000).")
+    p_search.add_argument("--offset", type=int, default=0, help="Result pagination offset (default: 0).")
+    p_search.add_argument("--max-chars", type=int, default=DEFAULT_CONTEXT_MAX_CHARS, help="Strict cap on total output characters (default: 12000).")
     p_search.add_argument("--max-entry-chars", type=int, default=DEFAULT_SEARCH_ENTRY_CHARS, help="Max preview characters per entry (default: 600).")
     p_search.add_argument("--json", action="store_true")
 
@@ -1072,6 +1286,8 @@ def main(argv=None):
             ensure_workspace_initialized(vault_dir)
             body = sys.stdin.read() if args.stdin else args.content
             effective_commit = args.commit or (detect_git_head_commit() if args.git else None)
+            effective_agent = args.agent or os.environ.get("PAGENT_AGENT_ID", "").strip() or None
+            effective_session = args.session or os.environ.get("PAGENT_SESSION_ID", "").strip() or None
             with VaultProcessLock(vault_dir, "agent-append", command=command_text(__file__, argv)):
                 res = append_log_entry(
                     vault_dir,
@@ -1086,6 +1302,8 @@ def main(argv=None):
                     files=args.files,
                     kind=args.kind,
                     commit=effective_commit,
+                    agent=effective_agent,
+                    session=effective_session,
                     merge_same_topic=not args.no_merge,
                 )
                 rebuild = {"ok": True}
@@ -1109,25 +1327,26 @@ def main(argv=None):
             return 0
 
         if args.subcommand == "context":
-            ctx = query_topic_context(
+            payload = query_topic_context(
                 vault_dir,
                 metadata_path,
                 rules_path,
                 args.topic,
                 limit=args.limit,
+                offset=args.offset,
                 mode=args.mode,
                 max_chars=args.max_chars,
                 max_entry_chars=args.max_entry_chars,
             )
-            payload = {"status": "ok", **ctx}
             lines = [
-                f"Topic: {' > '.join(ctx['topic_path'])} ({ctx['total_entries']} entries, mode={ctx['mode']})",
-                f"Review file: {ctx['review_path'] or '(none)'}",
+                f"Topic: {' > '.join(payload['topic_path'])} "
+                f"({payload['returned_entries']}/{payload['total_entries']} entries, mode={payload['mode']})",
+                f"Review file: {payload['review_path'] or '(none)'}",
             ]
-            if ctx["review_markdown"]:
-                lines.extend(["", ctx["review_markdown"].rstrip()])
-            elif ctx["mode"] == "index":
-                for item in ctx["entries"]:
+            if payload["review_markdown"]:
+                lines.extend(["", payload["review_markdown"].rstrip()])
+            elif payload["mode"] in {"index", "entries"}:
+                for item in payload["entries"]:
                     lines.append(
                         f"- [{item['source_id']}] {item['date']} · {item['title']} "
                         f"({item.get('kind') or 'note'}): {item.get('summary') or ''}"
@@ -1136,7 +1355,7 @@ def main(argv=None):
             return 0
 
         if args.subcommand == "search":
-            res = search_workspace_entries(
+            payload = search_workspace_entries(
                 vault_dir,
                 metadata_path,
                 rules_path,
@@ -1144,16 +1363,19 @@ def main(argv=None):
                 file_filter=args.file,
                 kind_filter=args.kind,
                 commit_filter=args.commit,
+                agent_filter=args.agent,
+                session_filter=args.session,
                 topic_filter=args.topic,
+                deep=args.deep,
                 limit=args.limit,
+                offset=args.offset,
                 max_chars=args.max_chars,
                 max_entry_chars=args.max_entry_chars,
             )
-            payload = {"status": "ok", **res}
-            lines = [f"Matches: {res['total_matches']}"]
-            if res["related_reviews"]:
-                lines.append(f"Related reviews: {', '.join(res['related_reviews'])}")
-            for item in res["results"]:
+            lines = [f"Matches: {payload['returned_entries']}/{payload['total_matches']}"]
+            if payload["related_reviews"]:
+                lines.append(f"Related reviews: {', '.join(payload['related_reviews'])}")
+            for item in payload["results"]:
                 cat_str = " > ".join(item["categories"][0]) if item["categories"] else "Unclassified"
                 kind_tag = f" [{item['kind']}]" if item.get("kind") else ""
                 files_tag = f" (files: {', '.join(item['files'])})" if item.get("files") else ""
@@ -1218,6 +1440,7 @@ def main(argv=None):
             return 0
 
         if args.subcommand == "source":
+            budget = _validate_max_chars(args.max_chars)
             metadata = load_metadata(metadata_path)
             entry = metadata.get("entries", {}).get(args.id)
             if not isinstance(entry, dict):
@@ -1227,13 +1450,15 @@ def main(argv=None):
                 vault_dir, tree, args.id, entry
             )
             meta = extract_entry_metadata(unit.content)
-            content_out, was_trunc = _truncate_text(unit.content, args.max_chars)
+            content_out, was_trunc = _truncate_text(unit.content, budget)
             payload = {
                 "status": "ok",
                 "source_id": args.id,
                 "kind": meta["kind"],
                 "files": meta["files"],
                 "commit": meta["commit"],
+                "agent": meta["agent"],
+                "session": meta["session"],
                 "summary": meta["summary"],
                 **entry,
                 "content": content_out,

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pagent"
-version = "0.3.0"
+dynamic = ["version"]
 description = "Deterministic Markdown work-history and topic context compiler for AI agents and humans"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -31,6 +31,9 @@ py-modules = [
     "workspace_paths",
     "workspace_viewer",
 ]
+
+[tool.setuptools.dynamic]
+version = { attr = "agent_cli.PAGENT_VERSION" }
 
 [tool.setuptools.package-data]
 viewer_ui = ["*.html", "*.css", "*.js"]

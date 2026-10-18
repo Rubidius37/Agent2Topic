@@ -284,6 +284,132 @@ class AgentCliTests(unittest.TestCase):
             self.assertEqual(code, 0)
             self.assertGreaterEqual(len(full_src["content"]), 96000)
 
+    def test_strict_500_char_json_budget_with_30_entries_and_pagination(self):
+        with patch.object(agent_cli, "run_production_classifier", side_effect=inprocess_classifier):
+            for i in range(30):
+                code, _res, _ = self.run_cli_json(
+                    "append",
+                    "--path",
+                    "Projects/Alpha/Testing",
+                    "--title",
+                    f"Bugfix iteration {i:02d}",
+                    "--kind",
+                    "bugfix",
+                    "--files",
+                    f"src/module_{i:02d}.py",
+                    "--date",
+                    "2026-10-18",
+                    "--no-update",
+                    "--content",
+                    f"Resolved edge case {i:02d} in authentication handler.",
+                )
+                self.assertEqual(code, 0)
+
+            code, _upd, _ = self.run_cli_json("update")
+            self.assertEqual(code, 0)
+
+            for mode in ("index", "review", "entries"):
+                code, data, raw_json = self.run_cli_json(
+                    "context",
+                    "--topic",
+                    "Projects/Alpha/Testing",
+                    "--mode",
+                    mode,
+                    "--max-chars",
+                    "500",
+                    "--limit",
+                    "30",
+                )
+                self.assertEqual(code, 0)
+                self.assertLessEqual(
+                    len(raw_json.strip()),
+                    500,
+                    f"context --mode {mode} exceeded 500 chars: {len(raw_json.strip())}",
+                )
+                self.assertTrue(data["budget_truncated"])
+                self.assertTrue(data["has_more"])
+
+            code, s_data, raw_search_json = self.run_cli_json(
+                "search",
+                "--kind",
+                "bugfix",
+                "--max-chars",
+                "500",
+                "--limit",
+                "30",
+            )
+            self.assertEqual(code, 0)
+            self.assertLessEqual(
+                len(raw_search_json.strip()),
+                500,
+                f"search exceeded 500 chars: {len(raw_search_json.strip())}",
+            )
+            self.assertTrue(s_data["budget_truncated"])
+            self.assertTrue(s_data["has_more"])
+
+            # Pagination with larger budget (1800 chars) returns multiple entries and next_offset
+            code, page1, raw_p1 = self.run_cli_json(
+                "context",
+                "--topic",
+                "Projects/Alpha/Testing",
+                "--mode",
+                "index",
+                "--max-chars",
+                "1800",
+                "--limit",
+                "30",
+            )
+            self.assertEqual(code, 0)
+            self.assertLessEqual(len(raw_p1.strip()), 1800)
+            self.assertGreater(page1["returned_entries"], 0)
+            self.assertLess(page1["returned_entries"], 30)
+            self.assertTrue(page1["has_more"])
+            self.assertEqual(page1["next_offset"], page1["returned_entries"])
+
+    def test_search_beyond_4000_chars_and_agent_session_metadata(self):
+        with patch.object(agent_cli, "run_production_classifier", side_effect=inprocess_classifier):
+            long_body = ("padding_word " * 360) + "\nspecial_needle_term at 4700 chars."
+            self.assertGreater(len(long_body), 4500)
+            code, res, _ = self.run_cli_json(
+                "append",
+                "--path",
+                "Projects/Alpha/Testing",
+                "--title",
+                "Deep search & provenance test",
+                "--kind",
+                "experiment",
+                "--agent",
+                "claude-code",
+                "--session",
+                "ses_998877",
+                "--date",
+                "2026-10-18",
+                "--content",
+                long_body,
+            )
+            self.assertEqual(code, 0)
+            self.assertEqual(res["agent"], "claude-code")
+            self.assertEqual(res["session"], "ses_998877")
+
+            # Search finds special_needle_term beyond 4,000 chars automatically via truncated flag fallback
+            code, found, _ = self.run_cli_json("search", "--query", "special_needle_term")
+            self.assertEqual(code, 0)
+            self.assertEqual(found["total_matches"], 1)
+            self.assertEqual(found["results"][0]["agent"], "claude-code")
+            self.assertEqual(found["results"][0]["session"], "ses_998877")
+
+            # Also filter by --agent and --session and --deep
+            code, by_agent, _ = self.run_cli_json(
+                "search",
+                "--agent",
+                "claude-code",
+                "--session",
+                "ses_998877",
+                "--deep",
+            )
+            self.assertEqual(code, 0)
+            self.assertEqual(by_agent["total_matches"], 1)
+
     def test_append_with_create_rule_and_manual_classify(self):
         with patch.object(agent_cli, "run_production_classifier", side_effect=inprocess_classifier):
             code, res, _ = self.run_cli_json(

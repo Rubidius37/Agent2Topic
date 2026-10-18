@@ -1889,8 +1889,11 @@ def _main_unlocked(argv=None):
                     "kind": entry_meta["kind"],
                     "files": entry_meta["files"],
                     "commit": entry_meta["commit"],
+                    "agent": entry_meta["agent"],
+                    "session": entry_meta["session"],
                     "summary": entry_meta["summary"],
                     "search_text": entry_meta["search_text"],
+                    "search_text_truncated": entry_meta["search_text_truncated"],
                 }
                 if manual_heading_path is not None:
                     entry_record["manual_heading_path"] = manual_heading_path

@@ -8,5 +8,5 @@ set "SCRIPT_DIR=%ROOT%scripts\"
 call "%SCRIPT_DIR%resolve_python.bat"
 if errorlevel 1 exit /b 1
 
-%PYTHON_CMD% -u "%SCRIPT_DIR%agent_cli.py" %*
+%PYTHON_CMD% -B -u "%SCRIPT_DIR%agent_cli.py" %*
 exit /b %ERRORLEVEL%
